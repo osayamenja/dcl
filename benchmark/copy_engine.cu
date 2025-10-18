@@ -13,7 +13,7 @@
 #include <iomanip>
 #include <algorithm>
 
-#include "util.cuh"
+#define SC(T, v) static_cast<T>(v)
 static void checkCuda(const cudaError_t err, const char* msg) {
     if (err != cudaSuccess) {
         std::cerr << "CUDA Error: " << msg << ": " << cudaGetErrorString(err) << std::endl;

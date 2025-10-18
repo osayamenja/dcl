@@ -58,6 +58,10 @@ dcl_target_common(bench_prefill_decode)
 # 2.) copy engine via cudaMemcpyPeerAsync
 add_executable(ce
         benchmark/copy_engine.cu
-        benchmark/util.cuh
 )
 dcl_target_common(ce)
+# 2.) ld,st latency
+add_executable(lat
+        benchmark/instruction_latency.cu
+)
+dcl_target_common(lat)
