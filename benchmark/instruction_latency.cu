@@ -179,6 +179,82 @@ __global__ void load_store_peer_kernel(const uint32_t* __restrict__ next_idx_loc
   *out_sink   = v ^ idx;  // keep live
 }
 
+// (4) LDGSTS (cp.async global->shared) + STORE(peer) latency
+// Measures a dependent sequence: pointer-chase -> cp.async -> ld.shared -> st.global(peer)
+// Serialized with data dependencies; reports cycles over ITERS.
+template<bool SYSTEM_VISIBLE>
+__global__ void ldgsts_store_peer_kernel(const uint32_t* __restrict__ src_base,
+                                         uint32_t* __restrict__ peer_dst,
+                                         uint64_t iters,
+                                         uint64_t* out_cycles,
+                                         uint32_t* out_sink)
+{
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+  __shared__ uint32_t s_word;
+  uint32_t idx = 0u;
+  uint32_t acc = 1u;
+
+  // Warmup
+  #pragma unroll 1
+  for (int w = 0; w < 64; ++w) {
+    idx = ld_cg_u32(src_base + idx);  // dependency (pointer-chase)
+    const void* gptr = src_base + idx;
+    auto smem_addr = static_cast<unsigned>(__cvta_generic_to_shared(&s_word));
+
+#if __CUDA_ARCH__ >= 800
+    //cp.async (LDGSTS): global -> shared
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;"
+                  :: "r"(smem_addr), "l"(gptr), "n"(4));
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_group 0;");
+#else
+    // Fallback for < SM80: ld.global + st.shared
+    uint32_t t = ld_cg_u32(static_cast<const uint32_t *>(gptr));
+    asm volatile("st.shared.u32 [%0], %1;" :: "r"(smem_addr), "r"(t));
+#endif
+    uint32_t val;
+    asm volatile("ld.shared.u32 %0, [%1];" : "=r"(val) : "r"(smem_addr));
+    acc = (acc ^ val) + 0x9e3779b9u;
+    st_wb_u32(peer_dst, acc);
+    if constexpr (SYSTEM_VISIBLE) { fence_sc_sys(); }
+  }
+  asm volatile ("" ::: "memory");
+
+  uint64_t start = clock64();
+
+#pragma unroll 1
+  for (uint64_t i = 0; i < iters; ++i) {
+    // 1) dependent address gen via pointer-chase to serialize
+    idx = ld_cg_u32(src_base + idx);
+
+    // 2) cp.async (LDGSTS) local global -> shared
+    const void* gptr = src_base + idx;
+    auto smem_addr = static_cast<unsigned>(__cvta_generic_to_shared(&s_word));
+
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;"
+                  :: "r"(smem_addr), "l"(gptr), "n"(4));
+    asm volatile("cp.async.commit_group;");
+    asm volatile("cp.async.wait_group 0;");
+#else
+    uint32_t t = ld_cg_u32(static_cast<const uint32_t*>(gptr));
+    asm volatile("st.shared.u32 [%0], %1;" :: "r"(smem_addr), "r"(t));
+#endif
+
+    // 3) consume from shared then 4) store to peer
+    uint32_t val;
+    asm volatile("ld.shared.u32 %0, [%1];" : "=r"(val) : "r"(smem_addr));
+    acc = acc + (val | 1u);          // tie iterations
+    st_wb_u32(peer_dst, acc);
+    if constexpr (SYSTEM_VISIBLE) { fence_sc_sys(); }
+  }
+
+  uint64_t stop = clock64();
+  *out_cycles = (stop - start);
+  *out_sink   = acc ^ idx;  // keep live
+}
+
 // ---------------------------------------------
 // Host utilities
 // ---------------------------------------------
@@ -315,6 +391,13 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaMalloc(&d_cycles_sysvis, sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_sink_peer_issue, sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_sink_peer_sysvis, sizeof(uint32_t)));
+    // After allocating peer result buffers for previous peer tests:
+    uint64_t *d_cycles_ldgsts_issue = nullptr, *d_cycles_ldgsts_sys = nullptr;
+    uint32_t *d_sink_ldgsts_issue   = nullptr, *d_sink_ldgsts_sys   = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_cycles_ldgsts_issue, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_cycles_ldgsts_sys,   sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_sink_ldgsts_issue,   sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_sink_ldgsts_sys,     sizeof(uint32_t)));
 
     // Launch: issue-only (no system fence)
     load_store_peer_kernel<false><<<grid, block>>>(d_next_dev0, d_peer_word_dev1, ITR,
@@ -325,6 +408,17 @@ int main(int argc, char** argv)
     // Launch: system-visible (fenced each iter)
     load_store_peer_kernel<true><<<grid, block>>>(d_next_dev0, d_peer_word_dev1, ITR,
                                                   d_cycles_sysvis, d_sink_peer_sysvis);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    ldgsts_store_peer_kernel<false><<<grid, block>>>(d_next_dev0, d_peer_word_dev1, ITR,
+                                                 d_cycles_ldgsts_issue, d_sink_ldgsts_issue);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Launch: LDGSTS path (system-visible per-iter)
+    ldgsts_store_peer_kernel<true><<<grid, block>>>(d_next_dev0, d_peer_word_dev1, ITR,
+                                                    d_cycles_ldgsts_sys, d_sink_ldgsts_sys);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -354,6 +448,25 @@ int main(int argc, char** argv)
            avg_sys_cycles,   sys_ns);
     printf("(Sinks) issue=%u sys=%u\n", sink_issue, sink_sys);
 
+    uint64_t cyc_ldgsts_issue=0, cyc_ldgsts_sys=0;
+    uint32_t sink_ldgsts_issue=0, sink_ldgsts_sys=0;
+    CUDA_CHECK(cudaMemcpy(&cyc_ldgsts_issue, d_cycles_ldgsts_issue, sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&cyc_ldgsts_sys,   d_cycles_ldgsts_sys,   sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sink_ldgsts_issue, d_sink_ldgsts_issue,  sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&sink_ldgsts_sys,   d_sink_ldgsts_sys,    sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+    double avg_ldgsts_issue = double(cyc_ldgsts_issue) / double(ITR);
+    double avg_ldgsts_sys   = double(cyc_ldgsts_sys)   / double(ITR);
+    double ns_ldgsts_issue  = (avg_ldgsts_issue / (ghz0 * 1e9)) * 1e9;
+    double ns_ldgsts_sys    = (avg_ldgsts_sys   / (ghz0 * 1e9)) * 1e9;
+
+    printf("\n=== LDGSTS(local Dev0) + STORE(peer Dev1)===\n");
+    printf("Issue-only (cp.async + st, no sys fence): %.1f cycles (~%.2f ns)\n",
+           avg_ldgsts_issue, ns_ldgsts_issue);
+    printf("System-visible (cp.async + st + fence):   %.1f cycles (~%.2f ns)\n",
+           avg_ldgsts_sys,   ns_ldgsts_sys);
+    printf("(Sinks) issue=%u sys=%u\n", sink_ldgsts_issue, sink_ldgsts_sys);
+
     // Cleanup peer allocations
     CUDA_CHECK(cudaFree(d_cycles_issue));
     CUDA_CHECK(cudaFree(d_cycles_sysvis));
@@ -362,6 +475,10 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaSetDevice(dev1));
     CUDA_CHECK(cudaFree(d_peer_word_dev1));
     CUDA_CHECK(cudaSetDevice(dev0));
+    CUDA_CHECK(cudaFree(d_cycles_ldgsts_issue));
+    CUDA_CHECK(cudaFree(d_cycles_ldgsts_sys));
+    CUDA_CHECK(cudaFree(d_sink_ldgsts_issue));
+    CUDA_CHECK(cudaFree(d_sink_ldgsts_sys));
   }
 
   // Cleanup Dev0 allocations
