@@ -46,10 +46,10 @@ size_t parseSize(const std::string& s) {
 struct Args {
     int src = 0;
     int dst = 1;
-    size_t minBytes = 1 << 10;   // 1 KiB
+    size_t minBytes = 1 << 29;   // 1 KiB
     size_t maxBytes = 1 << 30;   // 1 GiB
-    int iters = 100;
-    int warmup = 10;
+    int iters = 1;
+    int warmup = 1;
     int step = 2;                // geometric step factor
     bool header = true;
 };

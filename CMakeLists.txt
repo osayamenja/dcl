@@ -19,6 +19,7 @@ set(CMAKE_CUDA_FLAGS "-Xfatbin -compress-all -Xcudafe --display_error_number -Xc
 include(CheckCompilerFlag)
 find_package(CUDAToolkit REQUIRED)
 find_package(MPI REQUIRED COMPONENTS CXX)
+find_package(NVSHMEM REQUIRED HINTS "$ENV{NVSHMEM_HOME}/lib/cmake/nvshmem")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 string(SUBSTRING "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" 0 2 COMPUTE_CAPABILITY) # xx-real -> xx
 math(EXPR GPU_ARCH "${COMPUTE_CAPABILITY} * 10" OUTPUT_FORMAT DECIMAL)
@@ -31,6 +32,13 @@ function(dcl_target_common tgt)
             CUDA::nvtx3
             MPI::MPI_CXX
     )
+    if(${tgt} STREQUAL "nvsh")
+        target_link_libraries(${tgt} PRIVATE nvshmem::nvshmem)
+        set_target_properties(${tgt} PROPERTIES
+                CUDA_SEPARABLE_COMPILATION ON
+                CUDA_RESOLVE_DEVICE_SYMBOLS   ON
+        )
+    endif ()
 
     # Modern arch setting on the target itself
     set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES "native")
@@ -39,7 +47,7 @@ function(dcl_target_common tgt)
             $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g>
             $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-O0;-g;-G;--generate-line-info;-Xptxas=-v>
             $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-Xptxas=-v>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--generate-line-info;-Xptxas=-v>
     )
 endfunction()
 
@@ -60,8 +68,13 @@ add_executable(ce
         benchmark/copy_engine.cu
 )
 dcl_target_common(ce)
-# 2.) ld,st latency
+# 3.) ld,st latency
 add_executable(lat
         benchmark/instruction_latency.cu
 )
 dcl_target_common(lat)
+# 4.)
+add_executable(nvsh
+        benchmark/nvsh.cu
+)
+dcl_target_common(nvsh)
