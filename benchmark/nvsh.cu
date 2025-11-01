@@ -1,5 +1,6 @@
 // nvshmem_put_device_min.cu
 // Minimal device-side NVSHMEM put benchmark (block collective API).
+// Used for investigating emitted instructions
 // Measures per-iteration latency of: put_nbi_block + quiet
 // Prints: bytes,iters,total_us,avg_us,GBps,cycles_per_iter
 //
@@ -15,7 +16,7 @@
 __global__ void bw(void* __restrict__ dst, const void* __restrict__ src,
                                        const size_t __grid_constant__ nbytes,
                                        const int __grid_constant__ peer,
-                                       const uint64_t __grid_constant__ iters,
+                                       const int __grid_constant__ iters,
                                        uint64_t* __restrict__ cycles_out)
 {
     uint64_t start = 0, stop = 0;
@@ -23,7 +24,7 @@ __global__ void bw(void* __restrict__ dst, const void* __restrict__ src,
         start = clock64();
     }
 
-    for (uint64_t i = 0; i < iters; ++i) {
+    for (int i = 0; i < iters; ++i) {
         // Non-blocking put (block collective); all threads participate
         nvshmemx_putmem_nbi_block(dst, src, nbytes, peer);
 
@@ -38,9 +39,60 @@ __global__ void bw(void* __restrict__ dst, const void* __restrict__ src,
     }
 }
 
-static inline double to_us_from_cycles(uint64_t cycles, double ghz) {
+template<bool iterSync = true, bool nbi = true>
+__global__ void bw_v2(void* __restrict__ data,
+                                       const size_t __grid_constant__ nBytes,
+                                       const int __grid_constant__ peer,
+                                       const int __grid_constant__ iters,
+                                       uint64_t* __restrict__ cycles_out,
+                                       unsigned long long int* __restrict__ checkpoint)
+{
+    uint64_t start = 0;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int bid = static_cast<int>(blockIdx.x);
+    const int nB = static_cast<int>(gridDim.x);
+    const auto partition = nBytes / nB;
+    const int residue = static_cast<int>(nBytes % nB);
+    const auto slice = partition + (bid < residue);
+    const auto sOff =  partition + min(bid, residue);
+    if (!tid) {
+        start = clock64();
+    }
+
+    for (int i = 0; i < iters; i++) {
+        if constexpr (nbi) {
+            nvshmemx_putmem_nbi_block(data + sOff, data + sOff, slice, peer);
+        }
+        else {
+            nvshmemx_putmem_block(data + sOff, data + sOff, slice, peer);
+        }
+        // synchronizing across blocks
+        __syncthreads();
+        if constexpr (iterSync) {
+            if (!tid) {
+                __threadfence();
+                const auto expected = (i + 1) * nB;
+                bool checkAgain = (atomicAdd(checkpoint, 1) + 1) < expected;
+                while (checkAgain) {
+                    checkAgain = atomicAdd(checkpoint, 0) < expected;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (!tid) {
+        nvshmem_quiet();
+        const auto stop = clock64();
+        if (atomicAdd(checkpoint, 1) + 1 == (iters + 1) * nB) {
+            *cycles_out = stop - start;
+        }
+    }
+}
+
+static double to_us_from_cycles(const uint64_t& cycles, const double& ghz) {
     // cycles / (GHz * 1e9 cycles/s) => seconds -> microseconds
-    return (double)cycles / (ghz * 1e9) * 1e6;
+    return static_cast<double>(cycles) / (ghz * 1e9) * 1e6;
 }
 
 int main(int argc, char** argv) {
@@ -70,7 +122,7 @@ int main(int argc, char** argv) {
     double ghz = prop.clockRate / 1e6; // kHz -> GHz
 
     // Symmetric buffers (max size)
-    size_t max_bytes = size_t(1) << max_exp;
+    const auto max_bytes = static_cast<size_t>(1) << max_exp;
     void* src = nvshmem_malloc(max_bytes);
     void* dst = nvshmem_malloc(max_bytes);
     if (!src || !dst) {
@@ -98,7 +150,7 @@ int main(int argc, char** argv) {
 
     // Benchmark over sizes
     for (int e = min_exp; e <= max_exp; ++e) {
-        size_t nbytes = size_t(1) << e;
+        const auto nbytes = static_cast<size_t>(1) << e;
 
         // Sync all PEs and streams before measuring this size
         nvshmemx_barrier_all_on_stream(stream);
@@ -110,7 +162,7 @@ int main(int argc, char** argv) {
         nvshmemx_barrier_all_on_stream(stream);
 
         // Timed loop
-        bw<<<1, 256, 0, stream>>>(dst, src, nbytes, peer, (uint64_t)iters, d_cycles);
+        bw<<<1, 256, 0, stream>>>(dst, src, nbytes, peer, iters, d_cycles);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaStreamSynchronize(stream));
         nvshmemx_barrier_all_on_stream(stream);
@@ -120,10 +172,10 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpyAsync(&cycles, d_cycles, sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        double total_us = to_us_from_cycles(cycles, ghz);
-        double avg_us   = total_us / iters;
-        double GBps     = (double(nbytes) * iters) / (total_us * 1e-6) / 1e9;
-        double cyc_per_iter = (double)cycles / (double)iters;
+        const auto total_us = to_us_from_cycles(cycles, ghz);
+        const auto avg_us   = total_us / iters;
+        const auto GBps     = (static_cast<double>(nbytes) * iters) / (total_us * 1e-6) / 1e9;
+        const auto cyc_per_iter = static_cast<double>(cycles) / static_cast<double>(iters);
 
         if (mype == 0) {
             printf("%zu,%d,%.3f,%.6f,%.3f,%.1f\n",
