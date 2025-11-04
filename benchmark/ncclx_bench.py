@@ -5,7 +5,7 @@ import torch
 from torchcomms import new_comm
 
 
-def do_send_recv(torchcomm, send_tensor, recv_tensor, send_rank, recv_rank, async_op, rank):
+def do_send_recv(torchcomm, send_tensor, recv_tensor, send_rank, recv_rank, rank):
     """
     Enqueue send/recv in alternating order to avoid deadlock and measure GPU time using CUDA events.
     Returns:
@@ -15,33 +15,14 @@ def do_send_recv(torchcomm, send_tensor, recv_tensor, send_rank, recv_rank, asyn
     # Events
     start_total = torch.cuda.Event(enable_timing=True)
     end_total   = torch.cuda.Event(enable_timing=True)
-
-    start_send  = torch.cuda.Event(enable_timing=True)
-    end_send    = torch.cuda.Event(enable_timing=True)
-
-    start_recv  = torch.cuda.Event(enable_timing=True)
-    end_recv    = torch.cuda.Event(enable_timing=True)
-
     start_total.record(stream)
 
     if rank % 2 == 0:
         # Even ranks: send then recv
-        start_send.record(stream)
-        send_work = torchcomm.send(send_tensor, send_rank, async_op=async_op)
-        end_send.record(stream)
-
-        start_recv.record(stream)
-        recv_work = torchcomm.recv(recv_tensor, recv_rank, async_op=async_op)
-        end_recv.record(stream)
+        torchcomm.send(send_tensor, send_rank, async_op=False)
     else:
         # Odd ranks: recv then send
-        start_recv.record(stream)
-        recv_work = torchcomm.recv(recv_tensor, recv_rank, async_op=async_op)
-        end_recv.record(stream)
-
-        start_send.record(stream)
-        send_work = torchcomm.send(send_tensor, send_rank, async_op=async_op)
-        end_send.record(stream)
+        torchcomm.recv(recv_tensor, recv_rank, async_op=False)
 
     # Record end marker *after* both ops are enqueued on the same stream.
     end_total.record(stream)
@@ -49,11 +30,9 @@ def do_send_recv(torchcomm, send_tensor, recv_tensor, send_rank, recv_rank, asyn
     # Ensure GPU completion before reading elapsed times
     end_total.synchronize()
 
-    lat_total_ms = start_total.elapsed_time(end_total)
-    lat_send_ms  = start_send.elapsed_time(end_send)
-    lat_recv_ms  = start_recv.elapsed_time(end_recv)
+    lat_ms = start_total.elapsed_time(end_total)
 
-    return lat_send_ms, lat_recv_ms, lat_total_ms
+    return lat_ms
 
 
 def benchmark():
@@ -66,7 +45,6 @@ def benchmark():
     parser.add_argument("--scale", type=float, default=2.0, help="Geometric scale factor between sizes (e.g., 2.0)")
     parser.add_argument("--iters", type=int, default=32, help="Measured iterations per message size")
     parser.add_argument("--warmup", type=int, default=32, help="Warmup iterations per message size")
-    parser.add_argument("--async-op", action="store_true", help="Use async_op=True for send/recv")
     parser.add_argument("--device-backend", default="ncclx", help="TorchComm backend (default: ncclx)")
     parser.add_argument("--comm-name", default="bench_comm", help="TorchComm communicator name")
     args = parser.parse_args()
@@ -105,10 +83,10 @@ def benchmark():
         "world_size", "rank", "dtype", "async_op",
         "iters", "warmup",
         "elem_count", "bytes",
-        "lat_send_ms", "lat_recv_ms", "lat_total_ms",
-        "bw_send_GBps", "bw_total_GBps"
+        "lat_ms","bw_GBps"
     ]
-    print(",".join(header_cols))
+    if rank == 0:
+        print(",".join(header_cols))
 
     # Size sweep
     size_bytes = max(1, args.start_bytes)
@@ -125,46 +103,34 @@ def benchmark():
 
         # Warmup
         for _ in range(args.warmup):
-            do_send_recv(torchcomm, send_tensor, recv_tensor, send_rank, recv_rank, args.async_op, rank)
+            do_send_recv(torchcomm, send_tensor, recv_tensor, send_rank, recv_rank, rank)
 
         # Measured iterations
-        lat_send_acc = 0.0
-        lat_recv_acc = 0.0
-        lat_total_acc = 0.0
+        lat = 0.0
 
         for _ in range(args.iters):
-            ls, lr, lt = do_send_recv(torchcomm, send_tensor, recv_tensor, send_rank, recv_rank, args.async_op, rank)
-            lat_send_acc  += ls
-            lat_recv_acc  += lr
-            lat_total_acc += lt
+            lt = do_send_recv(torchcomm, send_tensor, recv_tensor, send_rank, recv_rank, rank)
+            lat += lt
 
-        lat_send_ms  = lat_send_acc / args.iters
-        lat_recv_ms  = lat_recv_acc / args.iters
-        lat_total_ms = lat_total_acc / args.iters
+        lat_ms = lat / args.iters
 
         # Bytes per direction = size_bytes
         # For total (send+recv), count both directions for this rank
-        seconds_total = lat_total_ms / 1e3
-        seconds_send  = lat_send_ms  / 1e3
+        seconds_total = lat_ms / 1e3
 
         # Guard against divide-by-zero in degenerate cases
-        bw_send_GBps  = (size_bytes / seconds_send) / (1 << 30) if seconds_send > 0 else float("inf")
-        bw_total_GBps = ((2 * size_bytes) / seconds_total) / (1 << 30) if seconds_total > 0 else float("inf")
+        bw_gbps = (size_bytes / seconds_total) / (1 << 30) if seconds_total > 0 else float("inf")
 
         row = [
             str(world_size),
             str(rank),
             args.dtype,
-            str(bool(args.async_op)),
             str(args.iters),
             str(args.warmup),
             str(elem_count),
             str(size_bytes),
-            f"{lat_send_ms:.6f}",
-            f"{lat_recv_ms:.6f}",
-            f"{lat_total_ms:.6f}",
-            f"{bw_send_GBps:.6f}",
-            f"{bw_total_GBps:.6f}",
+            f"{lat_ms:.6f}",
+            f"{bw_gbps:.6f}",
         ]
         if rank ==0 :
             print(",".join(row))
@@ -187,7 +153,7 @@ def main():
     if len(sys.argv) == 1:
         # ---- Original example ----
         device = torch.device("cuda")
-        torchcomm = new_comm("ncclx", device, name="main_comm")
+        torchcomm = new_comm("nccl", device, name="main_comm")
         rank = torchcomm.get_rank()
         world_size = torchcomm.get_size()
 
