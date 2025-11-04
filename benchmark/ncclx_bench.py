@@ -145,55 +145,7 @@ def benchmark():
 
 
 def main():
-    """
-    Keep your original sample as the default entry point, but you can run the benchmark by
-    calling this file with arguments (e.g., python bench.py --iters 50 --start-bytes 1024 --end-bytes 8388608 --async-op)
-    """
-    # If no CLI args besides program name, run the original example; otherwise run the benchmark.
-    if len(sys.argv) == 1:
-        # ---- Original example ----
-        device = torch.device("cuda")
-        torchcomm = new_comm("nccl", device, name="main_comm")
-        rank = torchcomm.get_rank()
-        world_size = torchcomm.get_size()
-
-        num_devices = torch.cuda.device_count()
-        device_id = rank % num_devices
-        target_device = torch.device(f"cuda:{device_id}")
-        print(f"Rank {rank}/{world_size}: Starting asynchronous send/recv example on device {device_id}")
-
-        tensor_size = 1024
-        send_tensor = torch.full((tensor_size,), float(rank), dtype=torch.float32, device=target_device)
-        recv_tensor = torch.zeros(tensor_size, dtype=torch.float32, device=target_device)
-
-        send_rank = (rank + 1) % world_size
-        recv_rank = (rank - 1 + world_size) % world_size
-        print(f"Rank {rank}: Sending to rank {send_rank}, receiving from rank {recv_rank}")
-
-        send_work = None
-        recv_work = None
-        if rank % 2 == 0:
-            send_work = torchcomm.send(send_tensor, send_rank, async_op=True)
-            recv_work = torchcomm.recv(recv_tensor, recv_rank, async_op=True)
-        else:
-            recv_work = torchcomm.recv(recv_tensor, recv_rank, async_op=True)
-            send_work = torchcomm.send(send_tensor, send_rank, async_op=True)
-
-        if send_work is not None:
-            send_work.wait()
-            print(f"Rank {rank}: Send operation completed")
-
-        if recv_work is not None:
-            recv_work.wait()
-            print(f"Rank {rank}: Receive operation completed")
-
-        torch.cuda.current_stream().synchronize()
-        torchcomm.finalize()
-        print(f"Rank {rank}: Asynchronous send/recv example completed")
-    else:
-        # ---- Benchmark mode ----
-        benchmark()
-
+    benchmark()
 
 if __name__ == "__main__":
     main()

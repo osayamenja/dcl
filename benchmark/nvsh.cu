@@ -14,6 +14,8 @@
 #define CUDA_CHECK(x) do { cudaError_t e = (x); if(e!=cudaSuccess){ \
   fprintf(stderr,"CUDA %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); std::exit(1);} } while(0)
 
+using ll_t = long long int;
+using ull_t = unsigned long long int;
 __global__ void bw(void* __restrict__ dst, const void* __restrict__ src,
                                        const size_t __grid_constant__ nbytes,
                                        const int __grid_constant__ peer,
@@ -40,66 +42,58 @@ __global__ void bw(void* __restrict__ dst, const void* __restrict__ src,
     }
 }
 
-template<bool iterSync = true, bool nbi = true>
+__device__ inline auto read_globaltimer() {
+    #if __CUDA_ARCH__ >= 700
+    ll_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+    #else
+    return clock64();  // fallback if you don’t care about cross-SM epoch
+    #endif
+}
+
 __global__
 void bw_v2(cuda::std::byte* __restrict__ dst, const cuda::std::byte* __restrict__ src,
                                        const size_t __grid_constant__ nBytes,
                                        const int __grid_constant__ peer,
                                        const int __grid_constant__ iters,
-                                       uint64_t* __restrict__ cycles_out,
+                                       ll_t* __restrict__ cycles_out,
                                        unsigned long long int* __restrict__ checkpoint)
 {
-    uint64_t start = 0;
+    ll_t start = 0;
     const int tid = static_cast<int>(threadIdx.x);
     const int bid = static_cast<int>(blockIdx.x);
     const int nB = static_cast<int>(gridDim.x);
     const auto partition = nBytes / nB;
     const int residue = static_cast<int>(nBytes % nB);
     const auto slice = partition + (bid < residue);
-    const auto sOff =  partition + min(bid, residue);
+    const auto sOff =  bid * partition + min(bid, residue);
     if (!tid) {
-        start = clock64();
+        start = read_globaltimer();
     }
-
+    __syncthreads();
     for (int i = 0; i < iters; i++) {
-        if constexpr (nbi) {
-            nvshmemx_putmem_nbi_block(dst + sOff, src + sOff, slice, peer);
-        }
-        else {
-            nvshmemx_putmem_block(dst + sOff, src + sOff, slice, peer);
-        }
-        // synchronizing across blocks
-        __syncthreads();
-        if constexpr (iterSync) {
-            if (!tid) {
-                __threadfence();
-                const auto expected = (i + 1) * nB;
-                bool checkAgain = (atomicAdd(checkpoint, 1) + 1) < expected;
-                while (checkAgain) {
-                    checkAgain = atomicAdd(checkpoint, 0) < expected;
-                }
-            }
-            __syncthreads();
+        nvshmemx_putmem_nbi_block(dst + sOff, src + sOff, slice, peer);
+        if (!tid) {
+            nvshmem_quiet();
         }
     }
-
     if (!tid) {
         __threadfence();
-        nvshmem_quiet();
-        const auto stop = clock64();
-        if (atomicAdd(checkpoint, 1) + 1 == (iters + 1) * nB) {
+        const auto stop = read_globaltimer();
+        if (atomicAdd(checkpoint, 1) + 1 == nB) {
             *cycles_out = stop - start;
         }
     }
 }
 
-static double to_us_from_cycles(const uint64_t& cycles, const double& ghz) {
+static auto to_us_from_cycles(const ll_t& cycles, const double& ghz) {
     // cycles / (GHz * 1e9 cycles/s) => seconds -> microseconds
     return static_cast<double>(cycles) / (ghz * 1e9) * 1e6;
 }
 
 // Parse sizes like 4096, 4K, 16M, 1G
-size_t parseSize(const std::string& s) {
+auto parseSize(const std::string& s) {
     char unit = 0;
     double val = 0.0;
     if (sscanf(s.c_str(), "%lf%c", &val, &unit) >= 1) {
@@ -136,8 +130,8 @@ Args parseArgs(const int argc, char** argv) {
         std::string key = argv[i];
         auto needVal = [&](const char* name){
             if (i+1 >= argc) { std::cerr << name << " requires a value\n"; std::exit(EXIT_FAILURE);} };
-        if (key == "--threads") { needVal("--src"); a.threads = std::stoi(argv[++i]); }
-        else if (key == "--ctas") { needVal("--dst"); a.ctas = std::stoi(argv[++i]); }
+        if (key == "--threads") { needVal("--threads"); a.threads = std::stoi(argv[++i]); }
+        else if (key == "--ctas") { needVal("--ctas"); a.ctas = std::stoi(argv[++i]); }
         else if (key == "--min") { needVal("--min"); a.minBytes = parseSize(argv[++i]); }
         else if (key == "--max") { needVal("--max"); a.maxBytes = parseSize(argv[++i]); }
         else if (key == "--iters") { needVal("--iters"); a.iters = std::stoi(argv[++i]); }
@@ -163,9 +157,6 @@ int main(int argc, char** argv) {
     const auto args = parseArgs(argc, argv);
 
     // Choose CUDA device for this PE via init_attr (recommended).
-    int dev_count = 0;
-    CUDA_CHECK(cudaGetDeviceCount(&dev_count));
-    if (dev_count == 0) { fprintf(stderr, "No CUDA devices.\n"); return 1; }
     nvshmem_init();  // minimal init
 
     const int mype = nvshmem_my_pe();
@@ -195,9 +186,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaStreamCreate(&stream));
     CUDA_CHECK(cudaMemsetAsync(src, 0xAB, args.maxBytes, stream));
     CUDA_CHECK(cudaMemsetAsync(dst, 0x00, args.maxBytes, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    int peer = (mype + 1) % npes;
+    const int peer = (mype + 1) % npes;
 
     if (mype == 0) {
         printf("# device-side NVSHMEM put benchmark (block API)\n");
@@ -206,11 +196,12 @@ int main(int argc, char** argv) {
     }
 
     // Device buffers for timing
-    uint64_t* d_cycles = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&d_cycles, 2 * sizeof(uint64_t), stream));
-    static_assert(sizeof(unsigned long long int) ==
-        sizeof(uint64_t) && alignof(unsigned long long int) == alignof(uint64_t));
-    auto* checkpoint = reinterpret_cast<unsigned long long int *>(d_cycles) + 1;
+    ll_t* d_cycles = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&d_cycles, 2 * sizeof(ll_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(d_cycles, 0, 2 * sizeof(ll_t), stream));
+    static_assert(sizeof(ll_t) ==
+        sizeof(ull_t) && alignof(ull_t) == alignof(ll_t));
+    auto* checkpoint = reinterpret_cast<ull_t*>(d_cycles) + 1;
     // Benchmark over sizes
     for (auto nBytes = args.minBytes; nBytes <= args.maxBytes; nBytes *= args.step) {
         // Sync all PEs and streams before measuring this size
@@ -229,11 +220,12 @@ int main(int argc, char** argv) {
         nvshmemx_barrier_all_on_stream(stream);
 
         // Fetch cycles
-        uint64_t cycles = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&cycles, d_cycles, sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
+        ll_t cycles = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&cycles, d_cycles, sizeof(ll_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        const auto total_us = to_us_from_cycles(cycles, ghz);
+        //const auto total_us = to_us_from_cycles(cycles, ghz);
+        const auto total_us = static_cast<double>(cycles) / 1000.0;
         const auto avg_us   = total_us / args.iters;
         const auto GBps     = (static_cast<double>(nBytes) * args.iters) / (total_us * 1e-6) / 1e9;
         const auto cyc_per_iter = static_cast<double>(cycles) / static_cast<double>(args.iters);
