@@ -30,7 +30,6 @@ function(dcl_target_common tgt)
             CUDA::cudart
             CUDA::cuda_driver
             CUDA::nvtx3
-            MPI::MPI_CXX
     )
     if(${tgt} STREQUAL "nvsh")
         target_link_libraries(${tgt} PRIVATE nvshmem::nvshmem)

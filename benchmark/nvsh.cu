@@ -53,43 +53,26 @@ __device__ inline auto read_globaltimer() {
 }
 
 __global__
-void bw_v2(cuda::std::byte* __restrict__ dst, const cuda::std::byte* __restrict__ src,
-                                       const size_t __grid_constant__ nBytes,
+void bw_v2(double* __restrict__ dst, const double* __restrict__ src,
+                                       const size_t __grid_constant__ partition,
                                        const int __grid_constant__ peer,
                                        const int __grid_constant__ iters,
-                                       ll_t* __restrict__ cycles_out,
-                                       unsigned long long int* __restrict__ checkpoint)
+                                       int* __restrict__ checkpoint)
 {
-    ll_t start = 0;
-    const int tid = static_cast<int>(threadIdx.x);
-    const int bid = static_cast<int>(blockIdx.x);
-    const int nB = static_cast<int>(gridDim.x);
-    const auto partition = nBytes / nB;
-    const int residue = static_cast<int>(nBytes % nB);
-    const auto slice = partition + (bid < residue);
-    const auto sOff =  bid * partition + min(bid, residue);
-    if (!tid) {
-        start = read_globaltimer();
+    const auto sOff = blockIdx.x * partition;
+    for (int i = 0; i < iters; i++) {
+        nvshmemx_double_put_nbi_block(dst + sOff, src + sOff, partition, peer);
     }
     __syncthreads();
-    for (int i = 0; i < iters; i++) {
-        nvshmemx_putmem_nbi_block(dst + sOff, src + sOff, slice, peer);
-        if (!tid) {
-            nvshmem_quiet();
-        }
+    if (!threadIdx.x) {
+        /*__threadfence();
+        auto allDone = atomicAdd(checkpoint, 1) + 1 == nB;
+        while (!allDone) {
+            allDone = atomicAdd(checkpoint, 0) == nB;
+        }*/
+        // wait until everyone is done
+        nvshmem_quiet();
     }
-    if (!tid) {
-        __threadfence();
-        const auto stop = read_globaltimer();
-        if (atomicAdd(checkpoint, 1) + 1 == nB) {
-            *cycles_out = stop - start;
-        }
-    }
-}
-
-static auto to_us_from_cycles(const ll_t& cycles, const double& ghz) {
-    // cycles / (GHz * 1e9 cycles/s) => seconds -> microseconds
-    return static_cast<double>(cycles) / (ghz * 1e9) * 1e6;
 }
 
 // Parse sizes like 4096, 4K, 16M, 1G
@@ -115,12 +98,12 @@ auto parseSize(const std::string& s) {
 }
 
 struct Args {
-    int threads = 128;
+    int threads = 256;
     int ctas = 32;
     size_t minBytes = 1 << 29;   // 1 KiB
     size_t maxBytes = 1 << 30;   // 1 GiB
-    int iters = 100;
-    int warmup = 10;
+    int iters = 10;
+    int warmup = 5;
     int step = 2;
 };
 
@@ -169,14 +152,14 @@ int main(int argc, char** argv) {
     const int dev = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
     CUDA_CHECK(cudaSetDevice(dev));
 
-    cudaDeviceProp prop{};
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
-    const double ghz = prop.clockRate / 1e6; // kHz -> GHz
+    cudaDeviceProp deviceProp{};
+    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, dev));
 
     // Symmetric buffers (max size)
     void* src_dst = nvshmem_malloc(args.maxBytes * 2);
-    auto* src = static_cast<cuda::std::byte*>(src_dst);
-    auto* dst = static_cast<cuda::std::byte*>(src_dst) + args.maxBytes;
+    using Element = double;
+    auto* src = static_cast<Element*>(src_dst);
+    auto* dst = src + (args.maxBytes / sizeof(Element));
     if (!src || !dst) {
         fprintf(stderr, "PE %d: nvshmem_malloc failed\n", mype);
         nvshmem_finalize(); return 1;
@@ -191,53 +174,58 @@ int main(int argc, char** argv) {
 
     if (mype == 0) {
         printf("# device-side NVSHMEM put benchmark (block API)\n");
-        printf("# npes=%d, device=%s, iters=%d\n", npes, prop.name, args.iters);
-        printf("bytes,iters,total_us,avg_us,GBps,cycles_per_iter\n");
+        printf("# npes=%d, device=%s, iters=%d\n", npes, deviceProp.name, args.iters);
+        printf("bytes,iters,total_us,avg_us,GBps\n");
     }
 
     // Device buffers for timing
-    ll_t* d_cycles = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&d_cycles, 2 * sizeof(ll_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(d_cycles, 0, 2 * sizeof(ll_t), stream));
-    static_assert(sizeof(ll_t) ==
-        sizeof(ull_t) && alignof(ull_t) == alignof(ll_t));
-    auto* checkpoint = reinterpret_cast<ull_t*>(d_cycles) + 1;
+    int* checkpoint = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&checkpoint, sizeof(int), stream));
     // Benchmark over sizes
-    for (auto nBytes = args.minBytes; nBytes <= args.maxBytes; nBytes *= args.step) {
-        // Sync all PEs and streams before measuring this size
-        nvshmemx_barrier_all_on_stream(stream);
+    float milliseconds;
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    if (!mype) {
+        for (auto nBytes = args.minBytes; nBytes <= args.maxBytes; nBytes *= args.step) {
+            // Sync all PEs and streams before measuring this size
+            nvshmemx_barrier_all_on_stream(stream);
+            CUDA_CHECK(cudaMemsetAsync(checkpoint, 0, sizeof(int), stream));
 
-        // Warmup a few iterations (device-side)
-        bw_v2<<<args.ctas,args.threads, 0, stream>>>(dst, src, nBytes, peer, args.warmup, d_cycles, checkpoint);
-        CUDA_CHECK(cudaPeekAtLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        nvshmemx_barrier_all_on_stream(stream);
+            // Warmup a few iterations (device-side)
+            const long int partition = static_cast<long int>(nBytes / sizeof(Element)) / args.ctas;
+            bw_v2<<<args.ctas,args.threads, 0, stream>>>(dst, src, partition, peer, args.warmup, checkpoint);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // Timed loop
-        bw_v2<<<args.ctas, args.threads, 0, stream>>>(dst, src, nBytes, peer, args.iters, d_cycles, checkpoint);
-        CUDA_CHECK(cudaPeekAtLastError());
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        nvshmemx_barrier_all_on_stream(stream);
+            CUDA_CHECK(cudaMemsetAsync(checkpoint, 0, sizeof(int), stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // Timed loop
+            CUDA_CHECK(cudaEventRecord(start));
+            bw_v2<<<args.ctas, args.threads, 0, stream>>>(dst, src, partition, peer, args.iters, checkpoint);
+            CUDA_CHECK(cudaEventRecord(stop));
+            CUDA_CHECK(cudaEventSynchronize(stop));
+            CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
 
-        // Fetch cycles
-        ll_t cycles = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&cycles, d_cycles, sizeof(ll_t), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+            //const auto total_us = to_us_from_cycles(cycles, ghz);
+            const auto avg_us = (static_cast<double>(milliseconds) / args.iters) * 1000.0;
+            const auto bytes_GB = static_cast<double>(nBytes) / (1024 * 1024 * 1024);
+            const auto GBps= bytes_GB / (avg_us / 1e6);
 
-        //const auto total_us = to_us_from_cycles(cycles, ghz);
-        const auto total_us = static_cast<double>(cycles) / 1000.0;
-        const auto avg_us   = total_us / args.iters;
-        const auto GBps     = (static_cast<double>(nBytes) * args.iters) / (total_us * 1e-6) / 1e9;
-        const auto cyc_per_iter = static_cast<double>(cycles) / static_cast<double>(args.iters);
-
-        if (mype == 0) {
-            printf("%zu,%d,%.3f,%.6f,%.3f,%.1f\n",
-                   nBytes, args.iters, total_us, avg_us, GBps, cyc_per_iter);
-            fflush(stdout);
+            if (mype == 0) {
+                printf("%zu,%d,%.2f,%.2f\n",
+                       nBytes, args.iters, avg_us, GBps);
+                fflush(stdout);
+            }
+        }
+    }
+    else {
+        for (auto nBytes = args.minBytes; nBytes <= args.maxBytes; nBytes *= args.step) {
+            nvshmemx_barrier_all_on_stream(stream);
         }
     }
 
-    CUDA_CHECK(cudaFreeAsync(d_cycles, stream));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     nvshmem_free(src_dst);
     CUDA_CHECK(cudaStreamDestroy(stream));
