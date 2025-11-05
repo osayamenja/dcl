@@ -66,28 +66,23 @@ add_executable(play
 dcl_target_common(play)
 
 # Benchmarks
-# 1.) Prefill and decode
-add_executable(bench_prefill_decode
-        benchmark/pd.cu
-)
-dcl_target_common(bench_prefill_decode)
-# 2.) copy engine via cudaMemcpyPeerAsync
+# copy engine via cudaMemcpyPeerAsync
 add_executable(ce
-        benchmark/copy_engine.cu
+        benchmark/copy_engine_bench.cu
 )
 dcl_target_common(ce)
-# 3.) ld,st latency
+# ld,st latency
 add_executable(lat
-        benchmark/instruction_latency.cu
+        benchmark/ldst_latency.cu
 )
 dcl_target_common(lat)
-# 4.) NVSHMEM Bench
+# NVSHMEM Bench
 add_executable(nvsh
-        benchmark/nvsh.cu
+        benchmark/nvshmem_bench.cu
 )
 dcl_target_common(nvsh)
-# 4.) NVSHMEM Bench
+# MSCCLPP Bench
 add_executable(msb
-        benchmark/msb.cu
+        benchmark/mscclpp_bench.cu
 )
 dcl_target_common(msb)

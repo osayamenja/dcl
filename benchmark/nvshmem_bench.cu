@@ -1,5 +1,5 @@
 // nvshmem_put_device_min.cu
-// Minimal device-side NVSHMEM put benchmark (block collective API).
+// Minimal device-side NVSHMEM put benchmark.
 // Used for investigating emitted instructions
 // Measures per-iteration latency of: put_nbi_block + quiet
 // Prints: bytes,iters,total_us,avg_us,GBps,cycles_per_iter
@@ -14,44 +14,9 @@
 
 #define CUDA_CHECK(x) do { cudaError_t e = (x); if(e!=cudaSuccess){ \
   fprintf(stderr,"CUDA %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); std::exit(1);} } while(0)
-#define B_TO_GB (1000 * 1000 * 1000)
+#define B_TO_GB (1024 * 1024 * 1024)
 using ll_t = long long int;
 using ull_t = unsigned long long int;
-__global__ void bw(void* __restrict__ dst, const void* __restrict__ src,
-                                       const size_t __grid_constant__ nbytes,
-                                       const int __grid_constant__ peer,
-                                       const int __grid_constant__ iters,
-                                       uint64_t* __restrict__ cycles_out)
-{
-    uint64_t start = 0, stop = 0;
-    if (threadIdx.x == 0) {
-        start = clock64();
-    }
-
-    for (int i = 0; i < iters; ++i) {
-        // Non-blocking put (block collective); all threads participate
-        nvshmemx_putmem_nbi_block(dst, src, nbytes, peer);
-
-        // Ensure completion of outstanding puts before next iter
-        nvshmem_quiet();  // device-side quiet
-        __syncthreads();   // serialize iterations for clean timing
-    }
-
-    if (threadIdx.x == 0) {
-        stop = clock64();
-        *cycles_out = (stop - start);
-    }
-}
-
-__device__ inline auto read_globaltimer() {
-    #if __CUDA_ARCH__ >= 700
-    ll_t t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    return t;
-    #else
-    return clock64();  // fallback if you don’t care about cross-SM epoch
-    #endif
-}
 
 __global__
 void bw_v2(double* __restrict__ dst, const double* __restrict__ src,
@@ -66,12 +31,6 @@ void bw_v2(double* __restrict__ dst, const double* __restrict__ src,
     }
     __syncthreads();
     if (!threadIdx.x) {
-        /*__threadfence();
-        auto allDone = atomicAdd(checkpoint, 1) + 1 == nB;
-        while (!allDone) {
-            allDone = atomicAdd(checkpoint, 0) == nB;
-        }*/
-        // wait until everyone is done
         nvshmem_quiet();
     }
 }
