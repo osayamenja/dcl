@@ -38,13 +38,13 @@ function(dcl_target_common tgt)
                 CUDA_RESOLVE_DEVICE_SYMBOLS   ON
         )
     endif ()
-    if(${tgt} STREQUAL "msb")
+    if(${tgt} STREQUAL "ms")
         find_library(MSCCLPP
                 NAMES libmscclpp.so
                 HINTS "$ENV{MSCCLPP_HOME}/lib"
                 REQUIRED
         )
-        target_link_libraries(${tgt} PRIVATE MSCCLPP MPI::MPI_CXX)
+        target_link_libraries(${tgt} PRIVATE "${MSCCLPP}" MPI::MPI_CXX)
         target_include_directories(${tgt} PRIVATE "$ENV{MSCCLPP_HOME}/include")
     endif ()
 
@@ -72,17 +72,17 @@ add_executable(ce
 )
 dcl_target_common(ce)
 # ld,st latency
-add_executable(lat
+add_executable(ldst
         benchmark/ldst_latency.cu
 )
-dcl_target_common(lat)
+dcl_target_common(ldst)
 # NVSHMEM Bench
 add_executable(nvsh
         benchmark/nvshmem_bench.cu
 )
 dcl_target_common(nvsh)
 # MSCCLPP Bench
-add_executable(msb
+add_executable(ms
         benchmark/mscclpp_bench.cu
 )
-dcl_target_common(msb)
+dcl_target_common(ms)
