@@ -38,6 +38,15 @@ function(dcl_target_common tgt)
                 CUDA_RESOLVE_DEVICE_SYMBOLS   ON
         )
     endif ()
+    if(${tgt} STREQUAL "msb")
+        find_library(MSCCLPP
+                NAMES libmscclpp.so
+                HINTS "$ENV{MSCCLPP_HOME}/lib"
+                REQUIRED
+        )
+        target_link_libraries(${tgt} PRIVATE MSCCLPP MPI::MPI_CXX)
+        target_include_directories(${tgt} PRIVATE "$ENV{MSCCLPP_HOME}/include")
+    endif ()
 
     # Modern arch setting on the target itself
     set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES "native")
@@ -72,8 +81,13 @@ add_executable(lat
         benchmark/instruction_latency.cu
 )
 dcl_target_common(lat)
-# 4.)
+# 4.) NVSHMEM Bench
 add_executable(nvsh
         benchmark/nvsh.cu
 )
 dcl_target_common(nvsh)
+# 4.) NVSHMEM Bench
+add_executable(msb
+        benchmark/msb.cu
+)
+dcl_target_common(msb)

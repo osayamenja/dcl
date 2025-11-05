@@ -8,12 +8,13 @@
 #include <nvshmem.h>
 #include <nvshmemx.h>
 #include <cuda_runtime.h>
+#include <cuda/std/atomic>
 #include <cstdio>
 #include <iostream>
 
 #define CUDA_CHECK(x) do { cudaError_t e = (x); if(e!=cudaSuccess){ \
   fprintf(stderr,"CUDA %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); std::exit(1);} } while(0)
-
+#define B_TO_GB (1000 * 1000 * 1000)
 using ll_t = long long int;
 using ull_t = unsigned long long int;
 __global__ void bw(void* __restrict__ dst, const void* __restrict__ src,
@@ -208,7 +209,7 @@ int main(int argc, char** argv) {
 
             //const auto total_us = to_us_from_cycles(cycles, ghz);
             const auto avg_us = (static_cast<double>(milliseconds) / args.iters) * 1000.0;
-            const auto bytes_GB = static_cast<double>(nBytes) / (1024 * 1024 * 1024);
+            const auto bytes_GB = static_cast<double>(nBytes) / B_TO_GB;
             const auto GBps= bytes_GB / (avg_us / 1e6);
 
             if (mype == 0) {
