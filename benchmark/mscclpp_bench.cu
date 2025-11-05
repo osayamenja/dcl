@@ -2,7 +2,7 @@
 // Created by osayamen on 11/5/25.
 //
 // Build: see CMakeLists.txt below
-// Run:   mpirun -np 2 ./p2p_mem_bench --min 1K --max 256M --step 2 --iters 100 --warmup 20 --transport cudaipc --ip_port lo:127.0.0.1:50505
+// Run:   mpirun -np 2 ./p2p_mem_bench --min 1K --max 256M --step 2 --iters 100 --warmup 20
 
 #include <cstdio>
 #include <string>
@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
   }
 
   // Sweep message sizes
-  for (size_t sz = minB; sz <= maxB; sz = (size_t)((double)sz * step + 0.5)) {
+  for (size_t sz = minB; sz <= maxB; sz *= step) {
     // Warmup
     for (int w=0; w<warmup; ++w) {
       put_kernel<<<blocks, threads, 0, stream>>>(devHandle, sz, rank, blocks*threads);

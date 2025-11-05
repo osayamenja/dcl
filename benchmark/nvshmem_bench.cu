@@ -14,7 +14,7 @@
 
 #define CUDA_CHECK(x) do { cudaError_t e = (x); if(e!=cudaSuccess){ \
   fprintf(stderr,"CUDA %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); std::exit(1);} } while(0)
-#define B_TO_GB (1024 * 1024 * 1024)
+#define B_TO_GB (1000 * 1000 * 1000)
 using ll_t = long long int;
 using ull_t = unsigned long long int;
 
