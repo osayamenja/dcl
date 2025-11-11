@@ -285,8 +285,10 @@ int main(int argc, char** argv)
   CUDA_CHECK(cudaSetDevice(dev0));
   cudaDeviceProp prop0{};
   CUDA_CHECK(cudaGetDeviceProperties(&prop0, dev0));
+  int clockRate = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(&clockRate, cudaDevAttrClockRate, dev0));
   printf("Dev0: %s | SM %d.%d | clockRate=%.3f GHz\n",
-         prop0.name, prop0.major, prop0.minor, prop0.clockRate / 1e6);
+         prop0.name, prop0.major, prop0.minor, clockRate / 1e6);
 
   // ------------------------------
   // Allocate & init pointer-chase (on Dev0)
@@ -331,7 +333,7 @@ int main(int argc, char** argv)
   CUDA_CHECK(cudaMemcpy(&sinkL,       d_sink_load,   sizeof(uint32_t), cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(&sinkS,       d_sink_store,  sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
-  double ghz0 = prop0.clockRate / 1e6; // GHz
+  double ghz0 = clockRate / 1e6; // GHz
   double avg_load_cycles  = double(cycles_load)  / double(ITR);
   double avg_store_cycles = double(cycles_store) / double(ITR);
   double load_ns  = (avg_load_cycles  / (ghz0 * 1e9)) * 1e9;

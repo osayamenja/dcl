@@ -31,12 +31,17 @@ function(dcl_target_common tgt)
             CUDA::cuda_driver
             CUDA::nvtx3
     )
-    if(${tgt} STREQUAL "nvsh")
+    if(${tgt} STREQUAL "nvsh" OR ${tgt} STREQUAL "dg")
         target_link_libraries(${tgt} PRIVATE nvshmem::nvshmem)
         set_target_properties(${tgt} PROPERTIES
                 CUDA_SEPARABLE_COMPILATION ON
                 CUDA_RESOLVE_DEVICE_SYMBOLS   ON
         )
+    endif ()
+    if(${tgt} STREQUAL "dg")
+        find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
+        target_link_libraries(${tgt} PRIVATE mathdx::cublasdx)
+        target_link_libraries(${tgt} PRIVATE MPI::MPI_CXX)
     endif ()
     if(${tgt} STREQUAL "ms")
         find_library(MSCCLPP
@@ -57,6 +62,7 @@ function(dcl_target_common tgt)
             $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
             $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--generate-line-info;-Xptxas=-v>
     )
+    target_compile_definitions(${tgt} PRIVATE ARCH=${GPU_ARCH})
 endfunction()
 
 # Playground for experimentation
@@ -65,7 +71,7 @@ add_executable(play
 )
 dcl_target_common(play)
 
-# Benchmarks
+## Benchmarks
 # copy engine via cudaMemcpyPeerAsync
 add_executable(ce
         benchmark/copy_engine_bench.cu
@@ -86,3 +92,8 @@ add_executable(ms
         benchmark/mscclpp_bench.cu
 )
 dcl_target_common(ms)
+# TP AG
+add_executable(dg
+        benchmark/dist_GEMM.cu
+)
+dcl_target_common(dg)
