@@ -10,32 +10,8 @@
 
 #define MAX_COPY_ENGINE 8
 #define CHECK_CUDA(x) do{cudaError_t e=(x); if(e!=cudaSuccess){ \
-  fprintf(stderr,"CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1);} }while(0)
-
-// --------------------
-// Cycle-burner stubs
-// --------------------
-// These emulate time for GEMMs and Collectives. Swap them with real calls later.
-
-__global__ void burn_kernel(int iters) {
-    // Simple integer/XOR mix to avoid compiler folding
-    unsigned int s = (threadIdx.x + 1u) * (blockIdx.x + 3u);
-#pragma unroll 1
-    for (int i = 0; i < iters; ++i) {
-        s ^= (s << 13);
-        s ^= (s >> 7);
-        s ^= (s << 17);
-    }
-    if (threadIdx.x == 0 && blockIdx.x == 0) { asm volatile(""); }
-}
-
-// Simulate compute proportional to MxNxK tiles by scaling thread blocks with size hints.
-void stub_gemm(cudaStream_t stream, size_t M, size_t N, size_t K, int iters_scale) {
-    // Heuristic grid/block based on output tile count
-    size_t tiles = (M * N + 256 - 1) / 256; // 256 outputs per block (arbitrary)
-    int blocks = (int) std::min<size_t>(std::max<size_t>(tiles, 1), 65535);
-    burn_kernel<<<blocks, 256, 0, stream>>>(iters_scale);
-}
+  fprintf(stderr,"CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1);} \
+}while(0)
 
 // --------------------
 // Args & parsing
@@ -96,11 +72,38 @@ static auto elapsed_ms(cudaEvent_t a, cudaEvent_t b) {
 }
 
 using Element = __half;
-__host__
-void dist_gemm(int mode, Element *dA, Element *dB, Element *dC,
-               const int M, const int N, const int K, const int rank, const int world) {
+enum class DG_OVERLAP_MODE {
+    NCCL,
+    CE,
+    NVSH_HOST,
+    NVSH_FUSED
+};
+__host__ __forceinline__
+void dist_gemm(const DG_OVERLAP_MODE mode, Element *dA, Element *dB, Element *dC,
+               const int M, const int N, const int K, const int rank, const int world,
+               const std::vector<cudaStream_t>& copyStreams) {
     constexpr auto alpha = 1.0f;
     constexpr auto beta = 0.0f;
+    const auto int nCopyStreams = static_cast<int>(copyStreams.size());
+    switch (mode) {
+        case DG_OVERLAP_MODE::NCCL: {
+            // do gemm chunk
+            // concurrently transfer chunk
+        }
+        case DG_OVERLAP_MODE::CE: {
+            // do gemm chunk
+            // concurrently transfer chunk
+        }
+        case DG_OVERLAP_MODE::NVSH_HOST: {
+            // do gemm chunk
+            // concurrently transfer chunk
+        }
+        case DG_OVERLAP_MODE::NVSH_FUSED: {
+            // within a fused kernel
+            // do gemm chunk
+            // concurrently transfer chunk
+        }
+    }
 }
 
 constexpr unsigned int PHILOX_SUBSEQS = 65536; // used to map (subsequence, offset) cleanly
@@ -170,15 +173,15 @@ void run_dist_gemm(const Args &a) {
     CHECK_CUDA(cudaSetDevice(rank));
     cudaStream_t computeStream;
     CHECK_CUDA(cudaStreamCreateWithFlags(&computeStream, cudaStreamNonBlocking));
-    std::array<cudaStream_t, MAX_COPY_ENGINE> copyStreams{};
+    int nCopyEngines = 0;
+    CHECK_CUDA(cudaDeviceGetAttribute(&nCopyEngines, cudaDevAttrAsyncEngineCount, rank));
+    std::vector<cudaStream_t> copyStreams(nCopyEngines);
     for (auto &copyStream: copyStreams) {
         cudaStream_t s;
         CHECK_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
         copyStream = s;
     }
     // allocate A, B and C buffers
-    int nCopyEngines = 0;
-    CHECK_CUDA(cudaDeviceGetAttribute(&nCopyEngines, cudaDevAttrAsyncEngineCount, rank));
     Element *dA = nullptr;
     constexpr auto aSeed = 41;
     const auto mSlice = a.M_max / world;
@@ -206,19 +209,22 @@ void run_dist_gemm(const Args &a) {
     CHECK_CUDA(cudaEventCreate(&t_req_end));
 
     for (int m = a.M_min; m <= a.M_max; m *= a.step_factor) {
+        constexpr auto nCases = 4;
         constexpr std::array cases{"NCCL-overlap", "CE-overlap", "NVSH-Host-overalap", "NVSH-Fused-overlap"};
-#pragma unroll
-        for (int c = 0; c < cases.size(); ++c) {
+        constexpr std::array dg_modes{DG_OVERLAP_MODE::NCCL, DG_OVERLAP_MODE::CE,
+            DG_OVERLAP_MODE::NVSH_HOST, DG_OVERLAP_MODE::NVSH_FUSED};
+        #pragma unroll
+        for (int c = 0; c < nCases; ++c) {
             if (rank == 0) {
                 printf("========%s========\nworld,M,N,K,E2E_ms\n", cases[c]);
             }
             for (int i = 0; i < a.warmup_iters; ++i) {
-                dist_gemm(c, dA, dB, dC, m, a.N, a.K, rank, world);
+                dist_gemm(dg_modes[c], dA, dB, dC, m, a.N, a.K, rank, world, copyStreams);
             }
             CHECK_CUDA(cudaDeviceSynchronize());
             CHECK_CUDA(cudaEventRecord(t_req_start));
             for (int j = 0; j < a.iters; ++j) {
-                dist_gemm(c, dA, dB, dC, m, a.N, a.K, rank, world);
+                dist_gemm(dg_modes[c], dA, dB, dC, m, a.N, a.K, rank, world, copyStreams);
             }
             CHECK_CUDA(cudaEventRecord(t_req_end));
             CHECK_CUDA(cudaEventSynchronize(t_req_end));
