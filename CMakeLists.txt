@@ -39,9 +39,13 @@ function(dcl_target_common tgt)
         )
     endif ()
     if(${tgt} STREQUAL "dg")
+        find_library(NCCL
+                NAMES libnccl_static.a
+                REQUIRED
+        )
         find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
         target_link_libraries(${tgt} PRIVATE mathdx::cublasdx)
-        target_link_libraries(${tgt} PRIVATE MPI::MPI_CXX)
+        target_link_libraries(${tgt} PRIVATE MPI::MPI_CXX CUDA::cublasLt_static "${NCCL}")
     endif ()
     if(${tgt} STREQUAL "ms")
         find_library(MSCCLPP

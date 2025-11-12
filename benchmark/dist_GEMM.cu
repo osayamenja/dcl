@@ -169,6 +169,74 @@ void fill_uniform(Element *__restrict__ d_out, const size_t n, cudaStream_t stre
     fill_uniform_kernel<RNG><<<grid, threads, 0, stream>>>(d_out, n, seed, offset);
 }
 
+template<typename T>
+__device__ __forceinline__ float to_float(const T& x) { return static_cast<float>(x); }
+template<>
+__device__ __forceinline__ float to_float<float>(const float& x) { return x; }
+template<>
+__device__ __forceinline__ float to_float<__half>(const __half& x) { return __half2float(x); }
+
+// --- Kernel: block-level reduction → single atomic per block ---
+template<int threads, typename T>
+__global__ void checkCorrectness(const T *__restrict__ pred, const T *__restrict__ ref,
+    const size_t n, unsigned long long* __restrict__ mismatches, const float atol = 1e-3f, const float rtol = 1e-3f) {
+    // Per-thread local accumulation
+    unsigned long long local = 0ULL;
+    const size_t stride = static_cast<size_t>(threads) * gridDim.x;
+    for (size_t i = blockIdx.x * static_cast<size_t>(threads) + threadIdx.x; i < n; i += stride) {
+        const float a = to_float(pred[i]);
+        const float b = to_float(ref[i]);
+        bool unequal = false;
+        if (isnan(a) || isnan(b)) {
+            // Treat NaN==NaN as equal; flip if you prefer mismatch on NaNs.
+            unequal = !(isnan(a) && isnan(b));
+        } else if (isinf(a) || isinf(b)) {
+            unequal = !(isinf(a) && isinf(b) && (a == b));
+        } else {
+            const float tol = atol + rtol * fmaxf(fabsf(a), fabsf(b));
+            unequal = fabsf(a - b) > tol;
+        }
+        if (unequal) ++local;
+    }
+    // Reduce per-block in shared memory
+    __shared__ unsigned long long sdata[threads];
+    sdata[threadIdx.x] = local;
+    __syncthreads();
+    // Tree reduction
+    #pragma unroll
+    for (unsigned int offset = threads >> 1; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+
+    // One atomic per block
+    if (!threadIdx.x) {
+        atomicAdd(mismatches, sdata[0]);
+    }
+}
+
+// --- Host helper: returns error percentage (0..100) ---
+template<int threads = 128, typename T>
+__host__ __forceinline__
+auto checkCorrectnessHost(const T *d_pred,
+                                                  const T *d_ref,
+                                                  const size_t n,
+                                                  unsigned long long *d_mis,
+                                                  cudaStream_t stream,
+                                                  const float atol = 1e-3f,
+                                                  const float rtol = 1e-3f) {
+    if (n == 0) return 0.0f;
+    const auto blocks = static_cast<int>((n + threads - 1) / threads);
+    CHECK_CUDA(cudaMemsetAsync(d_mis, 0, sizeof(unsigned long long), stream));
+    checkCorrectness<threads><<<blocks, threads, 0, stream>>>(d_pred, d_ref, n, d_mis, atol, rtol);
+    unsigned long long h_mis = 0;
+    CHECK_CUDA(cudaMemcpyAsync(&h_mis, d_mis, sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream));
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    return 100.0f * (static_cast<float>(h_mis) / static_cast<float>(n));
+}
+
 #define WORKSPACE_BYTES (32 * 1024 * 1024)
 __host__ __forceinline__
 void gemm_fp16_rowmajor_cublaslt(
@@ -215,8 +283,8 @@ void gemm_fp16_rowmajor_cublaslt(
     // telling Lt that D is (N x M) column-major with ldd = N (i.e., C^T).
     CUBLAS_CHECK(cublasLtMatmulDescCreate(&op_desc, compute, scale_dtype));
 
-    cublasOperation_t opA = CUBLAS_OP_N; // B
-    cublasOperation_t opB = CUBLAS_OP_T; // A^T
+    constexpr cublasOperation_t opA = CUBLAS_OP_N; // B
+    constexpr cublasOperation_t opB = CUBLAS_OP_T; // A^T
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
 
@@ -270,7 +338,7 @@ void gemm_fp16_rowmajor_cublaslt(
     CUBLAS_CHECK(cublasLtMatmulDescDestroy(op_desc));
 }
 
-__global__ void put(void* __restrict__ dest, const void* __restrict__ src, const int pe,
+__global__ void put(cuda::std::byte* __restrict__ dest, const cuda::std::byte* __restrict__ src, const int pe,
     const long int partition) {
     // assert (size % gridDim.x == 0)
     const auto sOff = blockIdx.x * partition;
@@ -365,8 +433,9 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                     const auto peer = (rank + j) % world;
                     const auto streamIdx = (j - 1) % copyStreams.size();
                     auto* dCp = dC + (peer * (M * N) + (i * mChunk * K));
-                    put<<<blocks, 128, 0, copyStreams[streamIdx]>>>(dCp, dCx, peer,
-                        static_cast<long int>(sizeof(Element) * chunkSize));
+                    put<<<blocks, 128, 0, copyStreams[streamIdx]>>>(reinterpret_cast<cuda::std::byte*>(dCp),
+                        reinterpret_cast<cuda::std::byte*>(dCx), peer,
+                        static_cast<long int>(sizeof(Element) * partition));
                 }
             }
         }
@@ -443,7 +512,9 @@ void run_dist_gemm(const Args &a) {
     constexpr auto bSeed = 42;
     CHECK_CUDA(cudaMallocAsync(&dB, a.N * a.K * sizeof(Element), computeStream));
     fill_uniform(dB, a.N * a.K, computeStream, bSeed);
-    auto *__restrict__ dC = static_cast<Element *>(nvshmem_malloc(a.M_max * a.N * sizeof(Element)));
+    Element* dCref = nullptr;
+    CHECK_CUDA(cudaMallocAsync(&dCref, a.M_max * a.N * sizeof(Element), computeStream));
+    auto *__restrict__ dC = static_cast<Element*>(nvshmem_malloc(a.M_max * a.N * sizeof(Element)));
     constexpr auto mChunk = 4;
     if (a.M_min % (world * mChunk) != 0) {
         if (rank == 0) {
@@ -454,6 +525,8 @@ void run_dist_gemm(const Args &a) {
     cudaStream_t s_comp, s_comm;
     CHECK_CUDA(cudaStreamCreateWithFlags(&s_comp, cudaStreamNonBlocking));
     CHECK_CUDA(cudaStreamCreateWithFlags(&s_comm, cudaStreamNonBlocking));
+    unsigned long long* d_mis = nullptr;
+    CHECK_CUDA(cudaMallocAsync(&d_mis, sizeof(unsigned long long), computeStream));
 
     // Events
     cudaEvent_t t_req_start, t_req_end;
@@ -467,8 +540,12 @@ void run_dist_gemm(const Args &a) {
             DG_OVERLAP_MODE::NVSH_HOST, DG_OVERLAP_MODE::NVSH_FUSED};
         #pragma unroll
         for (int c = 0; c < nCases; ++c) {
+            // correctness check
+            dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
+                    copyStreams, lt, workspace, comm);
+            const auto error = checkCorrectnessHost(dC, dCref, m * a.N, d_mis, computeStream);
             if (rank == 0) {
-                printf("========%s========\nworld,M,N,K,E2E_ms\n", cases[c]);
+                printf("========%s, error: %f========\nworld,M,N,K,E2E_ms\n", cases[c], error);
             }
             for (int i = 0; i < a.warmup_iters; ++i) {
                 dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
@@ -503,7 +580,6 @@ void run_dist_gemm(const Args &a) {
     nvshmem_free(dC);
     nvshmem_finalize();
 }
-
 // --------------------
 // Main
 // --------------------
