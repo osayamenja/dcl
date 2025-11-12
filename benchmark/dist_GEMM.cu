@@ -3,6 +3,7 @@
 #include <mpi.h>
 #include <nvshmem.h>
 #include <nccl.h>
+#include <cublasLt.h>
 
 // mathdx
 #include <cublasdx.hpp>
@@ -12,7 +13,28 @@
 #define CHECK_CUDA(x) do{cudaError_t e=(x); if(e!=cudaSuccess){ \
   fprintf(stderr,"CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1);} \
 }while(0)
-
+#define CUBLAS_CHECK(x) do { cublasStatus_t s=(x); if(s!=CUBLAS_STATUS_SUCCESS){ \
+fprintf(stderr,"cuBLASLt error %s:%d: status=%d\n", __FILE__, __LINE__, int(s)); std::abort(); } } while(0)
+#define NCCL_CHECK(call)                                                                                               \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        ncclResult_t status = call;                                                                                    \
+        if (status != ncclSuccess)                                                                                     \
+        {                                                                                                              \
+            fprintf(stderr, "NCCL error at %s:%d : %d\n", __FILE__, __LINE__, status);                                 \
+            exit(EXIT_FAILURE);                                                                                        \
+        }                                                                                                              \
+    } while (0)
+#define MPI_CHECK(call)                                                                                                \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        int status = call;                                                                                             \
+        if (status != MPI_SUCCESS)                                                                                     \
+        {                                                                                                              \
+            fprintf(stderr, "MPI error at %s:%d : %d\n", __FILE__, __LINE__, status);                                  \
+            exit(EXIT_FAILURE);                                                                                        \
+        }                                                                                                              \
+    } while (0)
 // --------------------
 // Args & parsing
 // --------------------
@@ -72,39 +94,21 @@ static auto elapsed_ms(cudaEvent_t a, cudaEvent_t b) {
 }
 
 using Element = __half;
+constexpr auto ncclT = ncclFloat16;
 enum class DG_OVERLAP_MODE {
     NCCL,
     CE,
     NVSH_HOST,
     NVSH_FUSED
 };
-__host__ __forceinline__
-void dist_gemm(const DG_OVERLAP_MODE mode, Element *dA, Element *dB, Element *dC,
-               const int M, const int N, const int K, const int rank, const int world,
-               const std::vector<cudaStream_t>& copyStreams) {
-    constexpr auto alpha = 1.0f;
-    constexpr auto beta = 0.0f;
-    const auto int nCopyStreams = static_cast<int>(copyStreams.size());
-    switch (mode) {
-        case DG_OVERLAP_MODE::NCCL: {
-            // do gemm chunk
-            // concurrently transfer chunk
-        }
-        case DG_OVERLAP_MODE::CE: {
-            // do gemm chunk
-            // concurrently transfer chunk
-        }
-        case DG_OVERLAP_MODE::NVSH_HOST: {
-            // do gemm chunk
-            // concurrently transfer chunk
-        }
-        case DG_OVERLAP_MODE::NVSH_FUSED: {
-            // within a fused kernel
-            // do gemm chunk
-            // concurrently transfer chunk
-        }
-    }
-}
+
+
+/**
+ * Compute: C = A * B^T
+ * A: (M,K) row-major, B: (N,K) row-major, C: (M,N) row-major
+ * Types: FP16 inputs/outputs, FP32 compute/scale
+ * Workspace: 32 MB
+ */
 
 constexpr unsigned int PHILOX_SUBSEQS = 65536; // used to map (subsequence, offset) cleanly
 
@@ -141,7 +145,8 @@ __global__ void fill_uniform_kernel(Element *__restrict__ out,
 
     // Generate 4 at once, then store only what fits
     const float4 r4 = dist.generate4(rng);
-    const half4 v{__float22half2_rn(float2{r4.x, r4.y}), __float22half2_rn(float2{r4.z, r4.w})};
+    const half4 v{__float22half2_rn(float2{r4.x, r4.y}),
+        __float22half2_rn(float2{r4.z, r4.w})};
     // Tail-safe stores
     if (n - base >= 4) {
         reinterpret_cast<half4 *>(out)[tid] = v;
@@ -164,6 +169,244 @@ void fill_uniform(Element *__restrict__ d_out, const size_t n, cudaStream_t stre
     fill_uniform_kernel<RNG><<<grid, threads, 0, stream>>>(d_out, n, seed, offset);
 }
 
+#define WORKSPACE_BYTES (32 * 1024 * 1024)
+__host__ __forceinline__
+void gemm_fp16_rowmajor_cublaslt(
+    cublasLtHandle_t lt, cudaStream_t stream,
+    const int M, const int N, const int K,
+    const __half *A, // (M,K), row-major
+    const __half *B, // (N,K), row-major
+    __half *C, void* workspace) // (M,N), row-major
+{
+    // Row-major leading dimensions
+    const int ldA = K; // A: (M x K)
+    const int ldB = K; // B: (N x K) -> we will use B^T
+    const int ldC = N; // C: (M x N)
+
+    // We’ll call cuBLASLt in column-major by using the standard
+    // “row-major via transpose” trick: compute C^T = (B * A^T)
+    // so that Lt sees column-major matrices without reshaping data.
+
+    // Descriptors
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t a_desc = nullptr, b_desc = nullptr, c_desc = nullptr, d_desc = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+
+    // Compute type & data types
+    constexpr cublasComputeType_t compute = CUBLAS_COMPUTE_32F;
+    constexpr cudaDataType_t dtype = CUDA_R_16F; // A,B,C,D are FP16
+    constexpr cudaDataType_t scale_dtype = CUDA_R_32F;
+
+    // Alpha/Beta in FP32 (Lt expects scale type tied to compute)
+    constexpr float alpha = 1.0f;
+    constexpr float beta = 0.0f;
+
+    // Workspace: 32 MB
+
+    // Operation: D = alpha * op(Acm) * op(Bcm) + beta * Ccm
+    // Map row-major C = A * B^T into column-major by swapping and transposing:
+    //   (row-major)  C(M,N) = A(M,K) * (B(N,K))^T  => C
+    // becomes
+    //   (col-major)  D^T(N,M) = (B * A^T)
+    // So we set:
+    //   opA = CUBLAS_OP_N on B (as column-major), dims: (N x K)
+    //   opB = CUBLAS_OP_T on A (as column-major), dims: (K x M)
+    // and output D has shape (N x M). We write directly into C as row-major by
+    // telling Lt that D is (N x M) column-major with ldd = N (i.e., C^T).
+    CUBLAS_CHECK(cublasLtMatmulDescCreate(&op_desc, compute, scale_dtype));
+
+    cublasOperation_t opA = CUBLAS_OP_N; // B
+    cublasOperation_t opB = CUBLAS_OP_T; // A^T
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
+
+    // Matrix layouts (COLUMN-MAJOR views)
+    // A_cm = B row-major reinterpreted as col-major with dims (N x K), lda_cm = ldB or K
+    // B_cm = A row-major reinterpreted as col-major with dims (K x M), ldb_cm = ldA or K
+    // C_cm/D_cm = C^T with dims (N x M), ldc_cm = ldd_cm = N
+    const int a_rows = N, a_cols = K, lda_cm = ldB;
+    const int b_rows = K, b_cols = M, ldb_cm = ldA;
+    const int cd_rows = N, cd_cols = M, ldc_cm = N, ldd_cm = N;
+
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&a_desc, dtype, a_rows, a_cols, lda_cm));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&b_desc, dtype, b_rows, b_cols, ldb_cm));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&c_desc, dtype, cd_rows, cd_cols, ldc_cm));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&d_desc, dtype, cd_rows, cd_cols, ldd_cm));
+
+    // Preference / heuristic
+    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+    constexpr auto w = WORKSPACE_BYTES;
+    CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &w, sizeof(w)));
+
+    cublasLtMatmulHeuristicResult_t heuristic{};
+    int returned = 0;
+    CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
+        lt, op_desc, a_desc, b_desc, c_desc, d_desc, pref, 1, &heuristic, &returned));
+    if (returned == 0) {
+        fprintf(stderr, "cuBLASLt: no heuristic found.\n");
+        std::abort();
+    }
+
+    // Launch: D_cm (N x M) = alpha * A_cm(B) * B_cm(A^T) + beta * C_cm(C^T)
+    CUBLAS_CHECK(cublasLtMatmul(
+        lt, op_desc,
+        &alpha,
+        /*A=*/B, a_desc,
+        /*B=*/A, b_desc,
+        &beta,
+        /*C=*/C, c_desc,
+        /*D=*/C, d_desc,
+        &heuristic.algo,
+        workspace, WORKSPACE_BYTES,
+        stream));
+
+    // Cleanup
+    CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(pref));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(d_desc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(c_desc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(b_desc));
+    CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(a_desc));
+    CUBLAS_CHECK(cublasLtMatmulDescDestroy(op_desc));
+}
+
+__global__ void put(void* __restrict__ dest, const void* __restrict__ src, const int pe,
+    const long int partition) {
+    // assert (size % gridDim.x == 0)
+    const auto sOff = blockIdx.x * partition;
+    nvshmemx_putmem_nbi_block(dest + sOff, src + sOff, partition, pe);
+}
+__host__ __forceinline__
+void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB, Element *dC,
+               const int gM, const int M, const int N, const int K, const int mChunk,
+               const int rank, const int world,
+               cudaStream_t computeStream,
+               const std::vector<cudaStream_t>& copyStreams,
+               cublasLtHandle_t lt, void* workspace, ncclComm_t comm) {
+    const int chunks = M / mChunk;
+    auto* dCL = dC + rank * (M * N);
+    switch (mode) {
+        case DG_OVERLAP_MODE::NCCL: {
+            // do gemm chunk
+            for (int i = 0; i < chunks; ++i) {
+                auto* dAx = dA + i * (mChunk * K);
+                auto* dCx = dCL + i * (mChunk * K);
+                gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dAx, dB, dCx, workspace);
+                // wait for current gemm to finish
+                CHECK_CUDA(cudaStreamSynchronize(computeStream));
+                // launch next GEMM asynchronously
+                if (i + 1 < chunks) {
+                    auto* dAx1 = dA + (i + 1) * (mChunk * K);
+                    auto* dCx1 = dCL + (i + 1) * (mChunk * K);
+                    gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dAx1, dB, dCx1, workspace);
+                }
+                // Meanwhile transfer completed chunk
+                const long int chunkSize = mChunk * N;
+
+                for (int j = 1; j < world; ++j) {
+                    const auto peer = (rank + j) % world;
+                    const auto streamIdx = (j - 1) % copyStreams.size();
+                    auto* dCp = dC + (peer * (M * N) + (i * mChunk * K));
+                    ncclGroupStart();
+                    // send
+                    ncclSend(dCx, chunkSize, ncclT, peer, comm, copyStreams[streamIdx]);
+                    // recv
+                    ncclRecv(dCp, chunkSize, ncclT, peer, comm, copyStreams[streamIdx]);
+                    ncclGroupEnd();
+                }
+            }
+        }
+        case DG_OVERLAP_MODE::CE: {
+            // do gemm chunk
+            // concurrently transfer chunk
+            for (int i = 0; i < chunks; ++i) {
+                auto* dAx = dA + i * (mChunk * K);
+                auto* dCx = dCL + i * (mChunk * K);
+                gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dAx, dB, dCx, workspace);
+                // wait for current gemm to finish
+                CHECK_CUDA(cudaStreamSynchronize(computeStream));
+                // launch next GEMM asynchronously
+                if (i + 1 < chunks) {
+                    auto* dAx1 = dA + (i + 1) * (mChunk * K);
+                    auto* dCx1 = dCL + (i + 1) * (mChunk * K);
+                    gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dAx1, dB, dCx1, workspace);
+                }
+                // Meanwhile transfer completed chunk
+                const long int chunkSize = mChunk * N;
+
+                for (int j = 1; j < world; ++j) {
+                    const auto peer = (rank + j) % world;
+                    const auto streamIdx = (j - 1) % copyStreams.size();
+                    auto* dCp = dC + (peer * (M * N) + (i * mChunk * K));
+                    // transfer with CE
+                    CHECK_CUDA(cudaMemcpyPeerAsync(dCp, peer, dCx, rank, sizeof(Element) * chunkSize,
+                        copyStreams[streamIdx]));
+                }
+            }
+        }
+        case DG_OVERLAP_MODE::NVSH_HOST: {
+            for (int i = 0; i < chunks; ++i) {
+                auto* dAx = dA + i * (mChunk * K);
+                auto* dCx = dCL + i * (mChunk * K);
+                gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dAx, dB, dCx, workspace);
+                // wait for current gemm to finish
+                CHECK_CUDA(cudaStreamSynchronize(computeStream));
+                // launch next GEMM asynchronously
+                if (i + 1 < chunks) {
+                    auto* dAx1 = dA + (i + 1) * (mChunk * K);
+                    auto* dCx1 = dCL + (i + 1) * (mChunk * K);
+                    gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dAx1, dB, dCx1, workspace);
+                }
+                // Meanwhile transfer completed chunk
+                const long int chunkSize = mChunk * N;
+                constexpr auto blocks = 8;
+                const long int partition = chunkSize / blocks;
+                for (int j = 1; j < world; ++j) {
+                    const auto peer = (rank + j) % world;
+                    const auto streamIdx = (j - 1) % copyStreams.size();
+                    auto* dCp = dC + (peer * (M * N) + (i * mChunk * K));
+                    put<<<blocks, 128, 0, copyStreams[streamIdx]>>>(dCp, dCx, peer,
+                        static_cast<long int>(sizeof(Element) * chunkSize));
+                }
+            }
+        }
+        case DG_OVERLAP_MODE::NVSH_FUSED: {
+            // within a fused kernel, overlap GEMM and tile-level communication
+        }
+    }
+
+    // sync all streams
+    if (mode != DG_OVERLAP_MODE::NVSH_FUSED) {
+        // complete communication
+        for (auto s: copyStreams) {
+            CHECK_CUDA(cudaStreamSynchronize(s));
+        }
+    }
+    nvshmemx_barrier_all_on_stream(computeStream);
+}
+
+__host__ __forceinline__
+auto init_nccl(const int rank, const int world) {
+    ncclUniqueId id;
+
+    if (rank == 0)
+    {
+        NCCL_CHECK(ncclGetUniqueId(&id));
+    }
+    MPI_CHECK(MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
+    ncclComm_t comm;
+    NCCL_CHECK(ncclCommInitRank(&comm, world, id, rank));
+    return comm;
+}
+
+__host__ __forceinline__
+void teardown_nccl(ncclComm_t comm) {
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    NCCL_CHECK(ncclCommFinalize(comm));
+    NCCL_CHECK(ncclCommDestroy(comm));
+}
+
+__host__ __forceinline__
 void run_dist_gemm(const Args &a) {
     // CSV header
     // initialize NVSHMEM backend
@@ -171,6 +414,8 @@ void run_dist_gemm(const Args &a) {
     const int rank = nvshmem_my_pe();
     const int world = nvshmem_n_pes();
     CHECK_CUDA(cudaSetDevice(rank));
+    // MPI is intialized in nvshmem_init
+    auto comm = init_nccl(rank, world);
     cudaStream_t computeStream;
     CHECK_CUDA(cudaStreamCreateWithFlags(&computeStream, cudaStreamNonBlocking));
     int nCopyEngines = 0;
@@ -181,6 +426,13 @@ void run_dist_gemm(const Args &a) {
         CHECK_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
         copyStream = s;
     }
+
+    cublasLtHandle_t lt;
+    CUBLAS_CHECK(cublasLtCreate(&lt));
+    void *workspace = nullptr;
+    constexpr size_t workspace_bytes = 32ul * 1024ul * 1024ul;
+    CHECK_CUDA(cudaMallocAsync(&workspace, workspace_bytes, computeStream));
+
     // allocate A, B and C buffers
     Element *dA = nullptr;
     constexpr auto aSeed = 41;
@@ -192,8 +444,8 @@ void run_dist_gemm(const Args &a) {
     CHECK_CUDA(cudaMallocAsync(&dB, a.N * a.K * sizeof(Element), computeStream));
     fill_uniform(dB, a.N * a.K, computeStream, bSeed);
     auto *__restrict__ dC = static_cast<Element *>(nvshmem_malloc(a.M_max * a.N * sizeof(Element)));
-
-    if (a.M_min % world != 0) {
+    constexpr auto mChunk = 4;
+    if (a.M_min % (world * mChunk) != 0) {
         if (rank == 0) {
             fprintf(stderr, "Incorrect M-min: %d\n", a.M_min);
         }
@@ -219,12 +471,14 @@ void run_dist_gemm(const Args &a) {
                 printf("========%s========\nworld,M,N,K,E2E_ms\n", cases[c]);
             }
             for (int i = 0; i < a.warmup_iters; ++i) {
-                dist_gemm(dg_modes[c], dA, dB, dC, m, a.N, a.K, rank, world, copyStreams);
+                dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
+                    copyStreams, lt, workspace, comm);
             }
             CHECK_CUDA(cudaDeviceSynchronize());
             CHECK_CUDA(cudaEventRecord(t_req_start));
             for (int j = 0; j < a.iters; ++j) {
-                dist_gemm(dg_modes[c], dA, dB, dC, m, a.N, a.K, rank, world, copyStreams);
+                dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
+                    copyStreams, lt, workspace, comm);
             }
             CHECK_CUDA(cudaEventRecord(t_req_end));
             CHECK_CUDA(cudaEventSynchronize(t_req_end));
@@ -237,6 +491,16 @@ void run_dist_gemm(const Args &a) {
     }
     CHECK_CUDA(cudaEventDestroy(t_req_start));
     CHECK_CUDA(cudaEventDestroy(t_req_end));
+    CHECK_CUDA(cudaStreamSynchronize(computeStream));
+    CHECK_CUDA(cudaFreeAsync(workspace, computeStream));
+    CHECK_CUDA(cudaFreeAsync(dA, computeStream));
+    CHECK_CUDA(cudaFreeAsync(dB, computeStream));
+    for (auto s: copyStreams) {
+        CHECK_CUDA(cudaStreamSynchronize(s));
+    }
+    CUBLAS_CHECK(cublasLtDestroy(lt));
+    teardown_nccl(comm);
+    nvshmem_free(dC);
     nvshmem_finalize();
 }
 
