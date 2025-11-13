@@ -62,7 +62,7 @@ static Args parse_args(const int argc, char **argv) {
     auto val = [&](const char *k, const int i) { return argv[i] + strlen(k); };
     for (int i = 1; i < argc; i++) {
         if (at("--M-min=", i)) a.M_min = ctoi(val("--M-min=", i));
-        if (at("--M-max=", i)) a.M_max = ctoi(val("--M-max=", i));
+        else if (at("--M-max=", i)) a.M_max = ctoi(val("--M-max=", i));
         else if (at("--N=", i)) a.N = ctoi(val("--N=", i));
         else if (at("--K=", i)) a.K = ctoi(val("--K=", i));
         else if (at("--iters=", i)) a.iters = ctoi(val("--iters=", i));
@@ -244,92 +244,116 @@ void gemm_fp16_rowmajor_cublaslt(
     const int M, const int N, const int K,
     const __half *A, // (M,K), row-major
     const __half *B, // (N,K), row-major
-    __half *C, void* workspace) // (M,N), row-major
+    __half *C,       // (M,N), row-major
+    void* workspace) // must be at least WORKSPACE_BYTES
 {
-    // Row-major leading dimensions
-    const int ldA = K; // A: (M x K)
-    const int ldB = K; // B: (N x K) -> we will use B^T
-    const int ldC = N; // C: (M x N)
+    // Row-major leading dimensions for underlying buffers
+    const int ldA_rm = K; // A: (M x K)
+    const int ldB_rm = K; // B: (N x K)
+    const int ldC_rm = N; // C: (M x N)
 
-    // We’ll call cuBLASLt in column-major by using the standard
-    // “row-major via transpose” trick: compute C^T = (B * A^T)
-    // so that Lt sees column-major matrices without reshaping data.
+    // cuBLASLt uses COLUMN-MAJOR descriptors. We reinterpret:
+    //
+    // A_rm(M,K) -> A_cm(K,M), ld = K
+    // B_rm(N,K) -> B_cm(K,N), ld = K
+    // C_rm(M,N) -> C_cm(N,M), ld = N
+    //
+    // We want: C_rm = A_rm * B_rm^T
+    // In col-major:
+    //   D_cm(N,M) = B_cm(K,N)^T * A_cm(K,M)
+    // i.e., opA = T on B_cm, opB = N on A_cm.
 
     // Descriptors
     cublasLtMatmulDesc_t op_desc = nullptr;
-    cublasLtMatrixLayout_t a_desc = nullptr, b_desc = nullptr, c_desc = nullptr, d_desc = nullptr;
+    cublasLtMatrixLayout_t a_desc = nullptr;
+    cublasLtMatrixLayout_t b_desc = nullptr;
+    cublasLtMatrixLayout_t c_desc = nullptr;
+    cublasLtMatrixLayout_t d_desc = nullptr;
     cublasLtMatmulPreference_t pref = nullptr;
 
-    // Compute type & data types
-    constexpr cublasComputeType_t compute = CUBLAS_COMPUTE_32F;
-    constexpr cudaDataType_t dtype = CUDA_R_16F; // A,B,C,D are FP16
-    constexpr cudaDataType_t scale_dtype = CUDA_R_32F;
+    constexpr cublasComputeType_t compute     = CUBLAS_COMPUTE_32F;
+    constexpr cudaDataType_t      dtype       = CUDA_R_16F;  // FP16 inputs/outputs
+    constexpr cudaDataType_t      scale_dtype = CUDA_R_32F;  // FP32 scaling
 
-    // Alpha/Beta in FP32 (Lt expects scale type tied to compute)
-    constexpr float alpha = 1.0f;
-    constexpr float beta = 0.0f;
+    float alpha = 1.0f;
+    float beta  = 0.0f;
 
-    // Workspace: 32 MB
-
-    // Operation: D = alpha * op(Acm) * op(Bcm) + beta * Ccm
-    // Map row-major C = A * B^T into column-major by swapping and transposing:
-    //   (row-major)  C(M,N) = A(M,K) * (B(N,K))^T  => C
-    // becomes
-    //   (col-major)  D^T(N,M) = (B * A^T)
-    // So we set:
-    //   opA = CUBLAS_OP_N on B (as column-major), dims: (N x K)
-    //   opB = CUBLAS_OP_T on A (as column-major), dims: (K x M)
-    // and output D has shape (N x M). We write directly into C as row-major by
-    // telling Lt that D is (N x M) column-major with ldd = N (i.e., C^T).
+    // 1) Matmul desc
     CUBLAS_CHECK(cublasLtMatmulDescCreate(&op_desc, compute, scale_dtype));
 
-    constexpr cublasOperation_t opA = CUBLAS_OP_N; // B
-    constexpr cublasOperation_t opB = CUBLAS_OP_T; // A^T
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
+    // opA = T (B_cm^T gives N x K)
+    // opB = N (A_cm gives K x M)
+    const cublasOperation_t opA = CUBLAS_OP_T;
+    const cublasOperation_t opB = CUBLAS_OP_N;
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+        op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
+        op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
 
-    // Matrix layouts (COLUMN-MAJOR views)
-    // A_cm = B row-major reinterpreted as col-major with dims (N x K), lda_cm = ldB or K
-    // B_cm = A row-major reinterpreted as col-major with dims (K x M), ldb_cm = ldA or K
-    // C_cm/D_cm = C^T with dims (N x M), ldc_cm = ldd_cm = N
-    const int a_rows = N, a_cols = K, lda_cm = ldB;
-    const int b_rows = K, b_cols = M, ldb_cm = ldA;
-    const int cd_rows = N, cd_cols = M, ldc_cm = N, ldd_cm = N;
+    // 2) Matrix layouts (COLUMN-MAJOR views)
 
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&a_desc, dtype, a_rows, a_cols, lda_cm));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&b_desc, dtype, b_rows, b_cols, ldb_cm));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&c_desc, dtype, cd_rows, cd_cols, ldc_cm));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&d_desc, dtype, cd_rows, cd_cols, ldd_cm));
+    // A operand (from B buffer):
+    // B_rm(N,K) -> B_cm(K,N), lda = K
+    // opA = T means A_op has shape (N x K)
+    const int a_rows = K;     // stored rows in column-major
+    const int a_cols = N;
+    const int lda_cm = ldB_rm;
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
+        &a_desc, dtype, a_rows, a_cols, lda_cm));
 
-    // Preference / heuristic
+    // B operand (from A buffer):
+    // A_rm(M,K) -> A_cm(K,M), ldb = K
+    // opB = N means B_op has shape (K x M)
+    const int b_rows = K;
+    const int b_cols = M;
+    const int ldb_cm = ldA_rm;
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
+        &b_desc, dtype, b_rows, b_cols, ldb_cm));
+
+    // C/D (output):
+    // C_rm(M,N) -> C_cm(N,M), ldc = ldd = N
+    const int cd_rows = N;
+    const int cd_cols = M;
+    const int ldc_cm  = ldC_rm;
+    const int ldd_cm  = ldC_rm;
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
+        &c_desc, dtype, cd_rows, cd_cols, ldc_cm));
+    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
+        &d_desc, dtype, cd_rows, cd_cols, ldd_cm));
+
+    // 3) Preference / heuristic
     CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
-    constexpr auto w = WORKSPACE_BYTES;
+    const size_t w = WORKSPACE_BYTES;
     CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
-        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &w, sizeof(w)));
+        pref,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &w,
+        sizeof(w)));
 
     cublasLtMatmulHeuristicResult_t heuristic{};
     int returned = 0;
     CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
-        lt, op_desc, a_desc, b_desc, c_desc, d_desc, pref, 1, &heuristic, &returned));
+        lt, op_desc, a_desc, b_desc, c_desc, d_desc,
+        pref, 1, &heuristic, &returned));
     if (returned == 0) {
         fprintf(stderr, "cuBLASLt: no heuristic found.\n");
         std::abort();
     }
 
-    // Launch: D_cm (N x M) = alpha * A_cm(B) * B_cm(A^T) + beta * C_cm(C^T)
+    // 4) Launch
     CUBLAS_CHECK(cublasLtMatmul(
         lt, op_desc,
         &alpha,
-        /*A=*/B, a_desc,
-        /*B=*/A, b_desc,
+        /*A=*/B, a_desc,   // B buffer as A operand
+        /*B=*/A, b_desc,   // A buffer as B operand
         &beta,
-        /*C=*/C, c_desc,
-        /*D=*/C, d_desc,
+        /*C=*/C, c_desc,   // C as input
+        /*D=*/C, d_desc,   // and as output
         &heuristic.algo,
         workspace, WORKSPACE_BYTES,
         stream));
 
-    // Cleanup
+    // 5) Cleanup
     CUBLAS_CHECK(cublasLtMatmulPreferenceDestroy(pref));
     CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(d_desc));
     CUBLAS_CHECK(cublasLtMatrixLayoutDestroy(c_desc));
@@ -344,6 +368,17 @@ __global__ void put(cuda::std::byte* __restrict__ dest, const cuda::std::byte* _
     const auto sOff = blockIdx.x * partition;
     nvshmemx_putmem_nbi_block(dest + sOff, src + sOff, partition, pe);
 }
+__host__ __forceinline__
+void printMatrix(const __half* __restrict__ const& p, const int& M, const int& N) {
+    for (int i = 0; i < M; ++i) {
+        printf("{");
+        for (int j = 0; j < N; ++j) {
+            printf("%f, ", __half2float(p[i * N + j]));
+        }
+        printf("}\n");
+    }
+}
+#define COMM_BLOCKS 8
 __host__ __forceinline__
 void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB, Element *dC,
                const int gM, const int M, const int N, const int K, const int mChunk,
@@ -384,6 +419,7 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                 }
             }
         }
+            break;
         case DG_OVERLAP_MODE::CE: {
             // do gemm chunk
             // concurrently transfer chunk
@@ -412,6 +448,7 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                 }
             }
         }
+            break;
         case DG_OVERLAP_MODE::NVSH_HOST: {
             for (int i = 0; i < chunks; ++i) {
                 auto* dAx = dA + i * (mChunk * K);
@@ -427,21 +464,22 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                 }
                 // Meanwhile transfer completed chunk
                 const long int chunkSize = mChunk * N;
-                constexpr auto blocks = 8;
-                const long int partition = chunkSize / blocks;
+                const long int partition = chunkSize / COMM_BLOCKS;
                 for (int j = 1; j < world; ++j) {
                     const auto peer = (rank + j) % world;
                     const auto streamIdx = (j - 1) % copyStreams.size();
                     auto* dCp = dC + (peer * (M * N) + (i * mChunk * K));
-                    put<<<blocks, 128, 0, copyStreams[streamIdx]>>>(reinterpret_cast<cuda::std::byte*>(dCp),
+                    put<<<COMM_BLOCKS, 128, 0, copyStreams[streamIdx]>>>(reinterpret_cast<cuda::std::byte*>(dCp),
                         reinterpret_cast<cuda::std::byte*>(dCx), peer,
                         static_cast<long int>(sizeof(Element) * partition));
                 }
             }
         }
+            break;
         case DG_OVERLAP_MODE::NVSH_FUSED: {
             // within a fused kernel, overlap GEMM and tile-level communication
         }
+            break;
     }
 
     // sync all streams
@@ -457,7 +495,6 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
 __host__ __forceinline__
 auto init_nccl(const int rank, const int world) {
     ncclUniqueId id;
-
     if (rank == 0)
     {
         NCCL_CHECK(ncclGetUniqueId(&id));
@@ -504,7 +541,7 @@ void run_dist_gemm(const Args &a) {
 
     // allocate A, B and C buffers
     Element *dA = nullptr;
-    constexpr auto aSeed = 41;
+    const auto aSeed = 41 * rank;
     const auto mSlice = a.M_max / world;
     CHECK_CUDA(cudaMallocAsync(&dA, mSlice * a.K * sizeof(Element), computeStream));
     fill_uniform(dA, mSlice * a.K, computeStream, aSeed);
@@ -513,21 +550,24 @@ void run_dist_gemm(const Args &a) {
     CHECK_CUDA(cudaMallocAsync(&dB, a.N * a.K * sizeof(Element), computeStream));
     fill_uniform(dB, a.N * a.K, computeStream, bSeed);
     Element* dCref = nullptr;
+    Element* dAref = nullptr;
     CHECK_CUDA(cudaMallocAsync(&dCref, a.M_max * a.N * sizeof(Element), computeStream));
+    CHECK_CUDA(cudaMallocAsync(&dAref, a.M_max * a.K * sizeof(Element), computeStream));
+    for (int i = 0; i < world; ++i) {
+        auto* dAp = dAref + (i * mSlice * a.K);
+        const auto rSeed = 41 * i;
+        fill_uniform(dAp, mSlice * a.K, computeStream, rSeed);
+    }
     auto *__restrict__ dC = static_cast<Element*>(nvshmem_malloc(a.M_max * a.N * sizeof(Element)));
     constexpr auto mChunk = 4;
-    if (a.M_min % (world * mChunk) != 0) {
+    if (a.M_min % (world * mChunk) != 0 && mChunk * a.N % COMM_BLOCKS != 0) {
         if (rank == 0) {
-            fprintf(stderr, "Incorrect M-min: %d\n", a.M_min);
+            fprintf(stderr, "Incorrect args: %d, %d\n", a.M_min, a.N);
         }
         return;
     }
-    cudaStream_t s_comp, s_comm;
-    CHECK_CUDA(cudaStreamCreateWithFlags(&s_comp, cudaStreamNonBlocking));
-    CHECK_CUDA(cudaStreamCreateWithFlags(&s_comm, cudaStreamNonBlocking));
     unsigned long long* d_mis = nullptr;
     CHECK_CUDA(cudaMallocAsync(&d_mis, sizeof(unsigned long long), computeStream));
-
     // Events
     cudaEvent_t t_req_start, t_req_end;
     CHECK_CUDA(cudaEventCreate(&t_req_start));
@@ -543,10 +583,12 @@ void run_dist_gemm(const Args &a) {
             // correctness check
             dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
                     copyStreams, lt, workspace, comm);
+            gemm_fp16_rowmajor_cublaslt(lt, computeStream, m, a.N, a.K, dAref, dB, dCref, workspace);
             const auto error = checkCorrectnessHost(dC, dCref, m * a.N, d_mis, computeStream);
             if (rank == 0) {
-                printf("========%s, error: %f========\nworld,M,N,K,E2E_ms\n", cases[c], error);
+                printf("%s, error, %f\nworld,M,N,K,E2E_ms\n", cases[c], error);
             }
+            break;
             for (int i = 0; i < a.warmup_iters; ++i) {
                 dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
                     copyStreams, lt, workspace, comm);
