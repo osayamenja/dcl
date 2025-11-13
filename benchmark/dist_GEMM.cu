@@ -4,6 +4,7 @@
 #include <nvshmem.h>
 #include <nccl.h>
 #include <cublasLt.h>
+#include <nvtx3/nvtx3.hpp>
 
 // mathdx
 #include <cublasdx.hpp>
@@ -204,7 +205,7 @@ __global__ void checkCorrectness(const T *__restrict__ pred, const T *__restrict
     __syncthreads();
     // Tree reduction
     #pragma unroll
-    for (unsigned int offset = threads >> 1; offset > 0; offset >>= 1) {
+    for (int offset = threads >> 1; offset > 0; offset >>= 1) {
         if (threadIdx.x < offset) {
             sdata[threadIdx.x] += sdata[threadIdx.x + offset];
         }
@@ -227,6 +228,7 @@ auto checkCorrectnessHost(const T *d_pred,
                                                   cudaStream_t stream,
                                                   const float atol = 1e-3f,
                                                   const float rtol = 1e-3f) {
+    NVTX3_FUNC_RANGE();
     if (n == 0) return 0.0f;
     const auto blocks = static_cast<int>((n + threads - 1) / threads);
     CHECK_CUDA(cudaMemsetAsync(d_mis, 0, sizeof(unsigned long long), stream));
@@ -247,6 +249,7 @@ void gemm_fp16_rowmajor_cublaslt(
     __half *C,       // (M,N), row-major
     void* workspace) // must be at least WORKSPACE_BYTES
 {
+    NVTX3_FUNC_RANGE();
     // Row-major leading dimensions for underlying buffers
     const int ldA_rm = K; // A: (M x K)
     const int ldB_rm = K; // B: (N x K)
@@ -386,21 +389,23 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                cudaStream_t computeStream,
                const std::vector<cudaStream_t>& copyStreams,
                cublasLtHandle_t lt, void* workspace, ncclComm_t comm) {
+    NVTX3_FUNC_RANGE();
     const int chunks = M / mChunk;
     auto* dCL = dC + rank * (M * N);
     switch (mode) {
         case DG_OVERLAP_MODE::NCCL: {
+            nvtx3::scoped_range ncclRange{"NCCL"};
             // do gemm chunk
             for (int i = 0; i < chunks; ++i) {
                 auto* dAx = dA + i * (mChunk * K);
-                auto* dCx = dCL + i * (mChunk * K);
+                auto* dCx = dCL + i * (mChunk * N);
                 gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dAx, dB, dCx, workspace);
                 // wait for current gemm to finish
-                CHECK_CUDA(cudaStreamSynchronize(computeStream));
+                CHECK_CUDA(cudaStreamSynchronize(computeStream)); // use stream wait event
                 // launch next GEMM asynchronously
                 if (i + 1 < chunks) {
                     auto* dAx1 = dA + (i + 1) * (mChunk * K);
-                    auto* dCx1 = dCL + (i + 1) * (mChunk * K);
+                    auto* dCx1 = dCL + (i + 1) * (mChunk * N);
                     gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dAx1, dB, dCx1, workspace);
                 }
                 // Meanwhile transfer completed chunk
@@ -409,7 +414,7 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                 for (int j = 1; j < world; ++j) {
                     const auto peer = (rank + j) % world;
                     const auto streamIdx = (j - 1) % copyStreams.size();
-                    auto* dCp = dC + (peer * (M * N) + (i * mChunk * K));
+                    auto* dCp = dC + (peer * (M * N) + (i * mChunk * N));
                     ncclGroupStart();
                     // send
                     ncclSend(dCx, chunkSize, ncclT, peer, comm, copyStreams[streamIdx]);
@@ -421,6 +426,7 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
         }
             break;
         case DG_OVERLAP_MODE::CE: {
+            nvtx3::scoped_range ceRange{"CE"};
             // do gemm chunk
             // concurrently transfer chunk
             for (int i = 0; i < chunks; ++i) {
@@ -450,6 +456,7 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
         }
             break;
         case DG_OVERLAP_MODE::NVSH_HOST: {
+            nvtx3::scoped_range nvshRange{"NVSH-HOST"};
             for (int i = 0; i < chunks; ++i) {
                 auto* dAx = dA + i * (mChunk * K);
                 auto* dCx = dCL + i * (mChunk * K);
@@ -477,6 +484,7 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
         }
             break;
         case DG_OVERLAP_MODE::NVSH_FUSED: {
+            nvtx3::scoped_range fused{"NVSH-FUSED"};
             // within a fused kernel, overlap GEMM and tile-level communication
         }
             break;
@@ -514,6 +522,7 @@ void teardown_nccl(ncclComm_t comm) {
 
 __host__ __forceinline__
 void run_dist_gemm(const Args &a) {
+    NVTX3_FUNC_RANGE();
     // CSV header
     // initialize NVSHMEM backend
     nvshmem_init();
@@ -588,7 +597,6 @@ void run_dist_gemm(const Args &a) {
             if (rank == 0) {
                 printf("%s, error, %f\nworld,M,N,K,E2E_ms\n", cases[c], error);
             }
-            break;
             for (int i = 0; i < a.warmup_iters; ++i) {
                 dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
                     copyStreams, lt, workspace, comm);
@@ -603,7 +611,8 @@ void run_dist_gemm(const Args &a) {
             CHECK_CUDA(cudaEventSynchronize(t_req_end));
             const auto e2e_ms = elapsed_ms(t_req_start, t_req_end);
             if (rank == 0) {
-                printf("%d,%d,%d,%d,%.4f\n", world, m, a.N, a.K, e2e_ms);
+                printf("%d,%d,%d,%d,%.4f\n", world, m, a.N, a.K,
+                    e2e_ms / static_cast<float>(a.iters));
                 fflush(stdout);
             }
         }
