@@ -1,4 +1,7 @@
 #include <array>
+#include <barrier>
+#include <thread>
+
 #include <cuda_runtime.h>
 #include <mpi.h>
 #include <nvshmem.h>
@@ -40,6 +43,8 @@ fprintf(stderr,"cuBLASLt error %s:%d: status=%d\n", __FILE__, __LINE__, int(s));
 // Args & parsing
 // --------------------
 struct Args {
+    int ce = 0;
+    int world = 1;
     int M_min = 1024;
     int M_max = 1024;
     int N = 4096; // hidden dim (cols)
@@ -69,6 +74,8 @@ static Args parse_args(const int argc, char **argv) {
         else if (at("--iters=", i)) a.iters = ctoi(val("--iters=", i));
         else if (at("--warmup_iters=", i)) a.warmup_iters = ctoi(val("--warmup_iters=", i));
         else if (at("--step=", i)) a.step_factor = ctoi(val("--step=", i));
+        else if (at("--world=", i)) a.world = ctoi(val("--world=", i));
+        else if (at("--ce=", i)) a.ce = ctoi(val("--ce=", i));
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             exit(0);
@@ -387,21 +394,19 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                const int gM, const int M, const int N, const int K, const int mChunk,
                const int rank, const int world,
                cudaStream_t computeStream,
-               const std::vector<cudaStream_t>& copyStreams,
-               cublasLtHandle_t lt, void* workspace, ncclComm_t comm) {
+               const std::vector<cudaStream_t>& copyStreams, cudaEvent_t gemmDone,
+               cublasLtHandle_t lt, void* workspace, ncclComm_t comm, Element* const* dCPeer = nullptr) {
     NVTX3_FUNC_RANGE();
     const int chunks = M / mChunk;
     auto* dCL = dC + rank * (M * N);
     switch (mode) {
         case DG_OVERLAP_MODE::NCCL: {
             nvtx3::scoped_range ncclRange{"NCCL"};
-            // do gemm chunk
+            // do gemm chunks
+            gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dA, dB, dCL, workspace);
             for (int i = 0; i < chunks; ++i) {
-                auto* dAx = dA + i * (mChunk * K);
-                auto* dCx = dCL + i * (mChunk * N);
-                gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dAx, dB, dCx, workspace);
-                // wait for current gemm to finish
-                CHECK_CUDA(cudaStreamSynchronize(computeStream)); // use stream wait event
+                // Record an event when previous GEMM is done
+                CHECK_CUDA(cudaEventRecord(gemmDone, computeStream));
                 // launch next GEMM asynchronously
                 if (i + 1 < chunks) {
                     auto* dAx1 = dA + (i + 1) * (mChunk * K);
@@ -410,16 +415,18 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                 }
                 // Meanwhile transfer completed chunk
                 const long int chunkSize = mChunk * N;
-
                 for (int j = 1; j < world; ++j) {
                     const auto peer = (rank + j) % world;
                     const auto streamIdx = (j - 1) % copyStreams.size();
                     auto* dCp = dC + (peer * (M * N) + (i * mChunk * N));
+                    const auto* dCx = dCL + i * (mChunk * N);
+                    auto  s = copyStreams[streamIdx];
+                    CHECK_CUDA(cudaStreamWaitEvent(s, gemmDone, 0));
                     ncclGroupStart();
                     // send
-                    ncclSend(dCx, chunkSize, ncclT, peer, comm, copyStreams[streamIdx]);
+                    ncclSend(dCx, chunkSize, ncclT, peer, comm, s);
                     // recv
-                    ncclRecv(dCp, chunkSize, ncclT, peer, comm, copyStreams[streamIdx]);
+                    ncclRecv(dCp, chunkSize, ncclT, peer, comm, s);
                     ncclGroupEnd();
                 }
             }
@@ -427,14 +434,10 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
             break;
         case DG_OVERLAP_MODE::CE: {
             nvtx3::scoped_range ceRange{"CE"};
-            // do gemm chunk
-            // concurrently transfer chunk
+            gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dA, dB, dCL, workspace);
             for (int i = 0; i < chunks; ++i) {
-                auto* dAx = dA + i * (mChunk * K);
-                auto* dCx = dCL + i * (mChunk * K);
-                gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dAx, dB, dCx, workspace);
                 // wait for current gemm to finish
-                CHECK_CUDA(cudaStreamSynchronize(computeStream));
+                CHECK_CUDA(cudaEventRecord(gemmDone, computeStream));
                 // launch next GEMM asynchronously
                 if (i + 1 < chunks) {
                     auto* dAx1 = dA + (i + 1) * (mChunk * K);
@@ -447,22 +450,24 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                 for (int j = 1; j < world; ++j) {
                     const auto peer = (rank + j) % world;
                     const auto streamIdx = (j - 1) % copyStreams.size();
-                    auto* dCp = dC + (peer * (M * N) + (i * mChunk * K));
+                    auto* dCp = dCPeer[peer] + (peer * (M * N) + (i * mChunk * K));
+                    assert(dCp != nullptr);
+                    const auto* dCx = dCL + i * (mChunk * N);
                     // transfer with CE
-                    CHECK_CUDA(cudaMemcpyPeerAsync(dCp, peer, dCx, rank, sizeof(Element) * chunkSize,
-                        copyStreams[streamIdx]));
+                    auto s = copyStreams[streamIdx];
+                    CHECK_CUDA(cudaStreamWaitEvent(s, gemmDone, 0));
+                    CHECK_CUDA(cudaMemcpyPeerAsync(dCp, peer, dCx, rank,
+                        sizeof(Element) * chunkSize, s));
                 }
             }
         }
             break;
         case DG_OVERLAP_MODE::NVSH_HOST: {
             nvtx3::scoped_range nvshRange{"NVSH-HOST"};
+            gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dA, dB, dCL, workspace);
             for (int i = 0; i < chunks; ++i) {
-                auto* dAx = dA + i * (mChunk * K);
-                auto* dCx = dCL + i * (mChunk * K);
-                gemm_fp16_rowmajor_cublaslt(lt, computeStream, mChunk, N, K, dAx, dB, dCx, workspace);
                 // wait for current gemm to finish
-                CHECK_CUDA(cudaStreamSynchronize(computeStream));
+                CHECK_CUDA(cudaEventRecord(gemmDone, computeStream));
                 // launch next GEMM asynchronously
                 if (i + 1 < chunks) {
                     auto* dAx1 = dA + (i + 1) * (mChunk * K);
@@ -476,8 +481,11 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                     const auto peer = (rank + j) % world;
                     const auto streamIdx = (j - 1) % copyStreams.size();
                     auto* dCp = dC + (peer * (M * N) + (i * mChunk * K));
-                    put<<<COMM_BLOCKS, 128, 0, copyStreams[streamIdx]>>>(reinterpret_cast<cuda::std::byte*>(dCp),
-                        reinterpret_cast<cuda::std::byte*>(dCx), peer,
+                    const auto* dCx = dCL + i * (mChunk * N);
+                    auto  s = copyStreams[streamIdx];
+                    CHECK_CUDA(cudaStreamWaitEvent(s, gemmDone, 0));
+                    put<<<COMM_BLOCKS, 128, 0, s>>>(reinterpret_cast<cuda::std::byte*>(dCp),
+                        reinterpret_cast<const cuda::std::byte*>(dCx), peer,
                         static_cast<long int>(sizeof(Element) * partition));
                 }
             }
@@ -497,7 +505,6 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
             CHECK_CUDA(cudaStreamSynchronize(s));
         }
     }
-    nvshmemx_barrier_all_on_stream(computeStream);
 }
 
 __host__ __forceinline__
@@ -529,7 +536,7 @@ void run_dist_gemm(const Args &a) {
     const int rank = nvshmem_my_pe();
     const int world = nvshmem_n_pes();
     CHECK_CUDA(cudaSetDevice(rank));
-    // MPI is intialized in nvshmem_init
+    // MPI is initialized in nvshmem_init
     auto comm = init_nccl(rank, world);
     cudaStream_t computeStream;
     CHECK_CUDA(cudaStreamCreateWithFlags(&computeStream, cudaStreamNonBlocking));
@@ -549,8 +556,10 @@ void run_dist_gemm(const Args &a) {
     CHECK_CUDA(cudaMallocAsync(&workspace, workspace_bytes, computeStream));
 
     // allocate A, B and C buffers
+    cudaEvent_t gemmDone;
+    CHECK_CUDA(cudaEventCreateWithFlags(&gemmDone, cudaEventDisableTiming));
     Element *dA = nullptr;
-    const auto aSeed = 41 * rank;
+    const auto aSeed = 41 * (rank + 1);
     const auto mSlice = a.M_max / world;
     CHECK_CUDA(cudaMallocAsync(&dA, mSlice * a.K * sizeof(Element), computeStream));
     fill_uniform(dA, mSlice * a.K, computeStream, aSeed);
@@ -564,12 +573,12 @@ void run_dist_gemm(const Args &a) {
     CHECK_CUDA(cudaMallocAsync(&dAref, a.M_max * a.K * sizeof(Element), computeStream));
     for (int i = 0; i < world; ++i) {
         auto* dAp = dAref + (i * mSlice * a.K);
-        const auto rSeed = 41 * i;
+        const auto rSeed = 41 * (i + 1);
         fill_uniform(dAp, mSlice * a.K, computeStream, rSeed);
     }
     auto *__restrict__ dC = static_cast<Element*>(nvshmem_malloc(a.M_max * a.N * sizeof(Element)));
     constexpr auto mChunk = 4;
-    if (a.M_min % (world * mChunk) != 0 && mChunk * a.N % COMM_BLOCKS != 0) {
+    if (a.M_min % (world * mChunk) != 0 || (mChunk * a.N) % COMM_BLOCKS != 0) {
         if (rank == 0) {
             fprintf(stderr, "Incorrect args: %d, %d\n", a.M_min, a.N);
         }
@@ -583,29 +592,35 @@ void run_dist_gemm(const Args &a) {
     CHECK_CUDA(cudaEventCreate(&t_req_end));
 
     for (int m = a.M_min; m <= a.M_max; m *= a.step_factor) {
-        constexpr auto nCases = 4;
-        constexpr std::array cases{"NCCL-overlap", "CE-overlap", "NVSH-Host-overalap", "NVSH-Fused-overlap"};
-        constexpr std::array dg_modes{DG_OVERLAP_MODE::NCCL, DG_OVERLAP_MODE::CE,
+        constexpr auto nCases = 3;
+        constexpr std::array cases{"NCCL-overlap", "NVSH-Host-overalap", "NVSH-Fused-overlap"};
+        constexpr std::array dg_modes{DG_OVERLAP_MODE::NCCL,
             DG_OVERLAP_MODE::NVSH_HOST, DG_OVERLAP_MODE::NVSH_FUSED};
         #pragma unroll
         for (int c = 0; c < nCases; ++c) {
             // correctness check
             dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
-                    copyStreams, lt, workspace, comm);
+                    copyStreams, gemmDone, lt, workspace, comm);
+            nvshmemx_barrier_all_on_stream(computeStream);
             gemm_fp16_rowmajor_cublaslt(lt, computeStream, m, a.N, a.K, dAref, dB, dCref, workspace);
             const auto error = checkCorrectnessHost(dC, dCref, m * a.N, d_mis, computeStream);
             if (rank == 0) {
-                printf("%s, error, %f\nworld,M,N,K,E2E_ms\n", cases[c], error);
+                printf("%s, error, %.2f %%, world,M,N,K,E2E_ms\n", cases[c], error);
+            }
+            else {
+                printf("%s, error, %.2f %%\n", cases[c], error);
             }
             for (int i = 0; i < a.warmup_iters; ++i) {
                 dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
-                    copyStreams, lt, workspace, comm);
+                    copyStreams, gemmDone, lt, workspace, comm);
+                nvshmemx_barrier_all_on_stream(computeStream);
             }
             CHECK_CUDA(cudaDeviceSynchronize());
             CHECK_CUDA(cudaEventRecord(t_req_start));
             for (int j = 0; j < a.iters; ++j) {
                 dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
-                    copyStreams, lt, workspace, comm);
+                    copyStreams, gemmDone, lt, workspace, comm);
+                nvshmemx_barrier_all_on_stream(computeStream);
             }
             CHECK_CUDA(cudaEventRecord(t_req_end));
             CHECK_CUDA(cudaEventSynchronize(t_req_end));
@@ -625,16 +640,157 @@ void run_dist_gemm(const Args &a) {
     CHECK_CUDA(cudaFreeAsync(dB, computeStream));
     for (auto s: copyStreams) {
         CHECK_CUDA(cudaStreamSynchronize(s));
+        CHECK_CUDA(cudaStreamDestroy(s));
     }
     CUBLAS_CHECK(cublasLtDestroy(lt));
+    CHECK_CUDA(cudaStreamSynchronize(computeStream));
     teardown_nccl(comm);
+    CHECK_CUDA(cudaStreamDestroy(computeStream));
     nvshmem_free(dC);
     nvshmem_finalize();
+}
+
+__host__ __forceinline__
+void t_ce(std::stop_token st, const Args& a, std::barrier<>& b, int rank, std::vector<Element*> const& dCpeer) {
+    const int world = a.world;
+    CHECK_CUDA(cudaSetDevice(rank));
+    cudaStream_t computeStream;
+    CHECK_CUDA(cudaStreamCreateWithFlags(&computeStream, cudaStreamNonBlocking));
+    int nCopyEngines = 0;
+    CHECK_CUDA(cudaDeviceGetAttribute(&nCopyEngines, cudaDevAttrAsyncEngineCount, rank));
+    std::vector<cudaStream_t> copyStreams(nCopyEngines);
+    for (auto &copyStream: copyStreams) {
+        cudaStream_t s;
+        CHECK_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+        copyStream = s;
+    }
+    cublasLtHandle_t lt;
+    CUBLAS_CHECK(cublasLtCreate(&lt));
+    void *workspace = nullptr;
+    constexpr size_t workspace_bytes = 32ul * 1024ul * 1024ul;
+    CHECK_CUDA(cudaMallocAsync(&workspace, workspace_bytes, computeStream));
+
+    // allocate A, B and C buffers
+    cudaEvent_t gemmDone;
+    CHECK_CUDA(cudaEventCreateWithFlags(&gemmDone, cudaEventDisableTiming));
+    Element *dA = nullptr;
+    const auto aSeed = 41 * (rank + 1);
+    const auto mSlice = a.M_max / world;
+    CHECK_CUDA(cudaMallocAsync(&dA, mSlice * a.K * sizeof(Element), computeStream));
+    fill_uniform(dA, mSlice * a.K, computeStream, aSeed);
+    Element *dB = nullptr;
+    constexpr auto bSeed = 42;
+    CHECK_CUDA(cudaMallocAsync(&dB, a.N * a.K * sizeof(Element), computeStream));
+    fill_uniform(dB, a.N * a.K, computeStream, bSeed);
+    Element* dCref = nullptr;
+    Element* dAref = nullptr;
+    CHECK_CUDA(cudaMallocAsync(&dCref, a.M_max * a.N * sizeof(Element), computeStream));
+    CHECK_CUDA(cudaMallocAsync(&dAref, a.M_max * a.K * sizeof(Element), computeStream));
+    for (int i = 0; i < world; ++i) {
+        auto* dAp = dAref + (i * mSlice * a.K);
+        const auto rSeed = 41 * (i + 1);
+        fill_uniform(dAp, mSlice * a.K, computeStream, rSeed);
+    }
+    constexpr auto mChunk = 4;
+    if (a.M_min % (world * mChunk) != 0 || (mChunk * a.N) % COMM_BLOCKS != 0) {
+        if (rank == 0) {
+            fprintf(stderr, "Incorrect args: %d, %d\n", a.M_min, a.N);
+        }
+        return;
+    }
+    unsigned long long* d_mis = nullptr;
+    CHECK_CUDA(cudaMallocAsync(&d_mis, sizeof(unsigned long long), computeStream));
+    // Events
+    cudaEvent_t t_req_start, t_req_end;
+    CHECK_CUDA(cudaEventCreate(&t_req_start));
+    CHECK_CUDA(cudaEventCreate(&t_req_end));
+    auto* dC = dCpeer[rank];
+    for (int m = a.M_min; m <= a.M_max; m *= a.step_factor) {
+        // correctness check
+        dist_gemm(DG_OVERLAP_MODE::CE, dA, dB, dC,m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
+                copyStreams, gemmDone, lt, workspace, nullptr, dCpeer.data());
+        CHECK_CUDA(cudaStreamSynchronize(computeStream));
+        b.arrive_and_wait();
+        // thread barrier
+        gemm_fp16_rowmajor_cublaslt(lt, computeStream, m, a.N, a.K, dAref, dB, dCref, workspace);
+        const auto error = checkCorrectnessHost(dC, dCref, m * a.N, d_mis, computeStream);
+        if (rank == 0) {
+            printf("CE-OVERLAP, error, %.2f %%, world,M,N,K,E2E_ms\n", error);
+        }
+        else {
+            printf("CE-OVERLAP, error, %.2f %%\n", error);
+        }
+        for (int i = 0; i < a.warmup_iters; ++i) {
+            dist_gemm(DG_OVERLAP_MODE::CE, dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
+                copyStreams, gemmDone, lt, workspace, nullptr, dCpeer.data());
+            CHECK_CUDA(cudaStreamSynchronize(computeStream));
+            b.arrive_and_wait();
+        }
+        CHECK_CUDA(cudaDeviceSynchronize());
+        CHECK_CUDA(cudaEventRecord(t_req_start));
+        for (int j = 0; j < a.iters; ++j) {
+            dist_gemm(DG_OVERLAP_MODE::CE, dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
+                copyStreams, gemmDone, lt, workspace, nullptr, dCpeer.data());
+            CHECK_CUDA(cudaStreamSynchronize(computeStream));
+            b.arrive_and_wait();
+        }
+        CHECK_CUDA(cudaEventRecord(t_req_end));
+        CHECK_CUDA(cudaEventSynchronize(t_req_end));
+        const auto e2e_ms = elapsed_ms(t_req_start, t_req_end);
+        if (rank == 0) {
+            printf("%d,%d,%d,%d,%.4f\n", world, m, a.N, a.K,
+                e2e_ms / static_cast<float>(a.iters));
+            fflush(stdout);
+        }
+    }
+    CHECK_CUDA(cudaEventDestroy(t_req_start));
+    CHECK_CUDA(cudaEventDestroy(t_req_end));
+    CHECK_CUDA(cudaStreamSynchronize(computeStream));
+    CHECK_CUDA(cudaFreeAsync(workspace, computeStream));
+    CHECK_CUDA(cudaFreeAsync(dA, computeStream));
+    CHECK_CUDA(cudaFreeAsync(dB, computeStream));
+    for (auto s: copyStreams) {
+        CHECK_CUDA(cudaStreamSynchronize(s));
+        CHECK_CUDA(cudaStreamDestroy(s));
+    }
+    CUBLAS_CHECK(cublasLtDestroy(lt));
+    CHECK_CUDA(cudaStreamSynchronize(computeStream));
+    CHECK_CUDA(cudaStreamDestroy(computeStream));
+}
+__host__ __forceinline__
+void dist_gemm_ce(const Args& a) {
+    const int world = a.world;
+    const auto mSlice = a.M_max / world;
+    std::vector<Element*> ptrs (world);
+    std::barrier sync_point(world);
+    for (int i = 0; i < world; ++i) {
+        Element* dC = nullptr;
+        CHECK_CUDA(cudaSetDevice(i));
+        // malloc result array
+        CHECK_CUDA(cudaMalloc(&dC, mSlice * a.N * sizeof(Element)));
+        ptrs[i] = dC;
+    }
+    std::vector<std::jthread> workers;
+    workers.reserve(world);
+    for (int i = 0; i < world; ++i) {
+        // Capture by reference where appropriate; rank by value
+        int rank = i;
+        workers.emplace_back(
+            [&, rank](std::stop_token st) {
+                t_ce(st, a, sync_point, rank, ptrs);
+            }
+        );
+    }
 }
 // --------------------
 // Main
 // --------------------
 int main(const int argc, char **argv) {
-    run_dist_gemm(parse_args(argc, argv));
+    if (const auto a = parse_args(argc, argv); a.ce) {
+        dist_gemm_ce(a);
+    }
+    else {
+        run_dist_gemm(a);
+    }
     return 0;
 }
