@@ -372,7 +372,7 @@ void gemm_fp16_rowmajor_cublaslt(
     CUBLAS_CHECK(cublasLtMatmulDescDestroy(op_desc));
 }
 
-__global__ void put(cuda::std::byte* __restrict__ dest, const cuda::std::byte* __restrict__ src, const int pe,
+__global__ void put(cuda::std::byte* dest, const cuda::std::byte* src, const int pe,
     const long int partition) {
     // assert (size % gridDim.x == 0)
     const auto sOff = blockIdx.x * partition;
@@ -446,7 +446,6 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                 }
                 // Meanwhile transfer completed chunk
                 const long int chunkSize = mChunk * N;
-
                 for (int j = 1; j < world; ++j) {
                     const auto peer = (rank + j) % world;
                     const auto streamIdx = (j - 1) % copyStreams.size();
@@ -592,7 +591,7 @@ void run_dist_gemm(const Args &a) {
 
     for (int m = a.M_min; m <= a.M_max; m *= a.step_factor) {
         constexpr auto nCases = 3;
-        constexpr std::array cases{"NCCL-overlap", "NVSH-Host-overalap", "NVSH-Fused-overlap"};
+        constexpr std::array cases{"NCCL-overlap", "NVSH-Host-overlap", "NVSH-Fused-overlap"};
         constexpr std::array dg_modes{DG_OVERLAP_MODE::NCCL,
             DG_OVERLAP_MODE::NVSH_HOST, DG_OVERLAP_MODE::NVSH_FUSED};
         #pragma unroll
@@ -650,7 +649,7 @@ void run_dist_gemm(const Args &a) {
 }
 
 __host__ __forceinline__
-void t_ce(std::stop_token st, const Args& a, std::barrier<>& b, int rank, std::vector<Element*> const& dCpeer) {
+void t_ce(const Args& a, std::barrier<>& b, int rank, std::vector<Element*> const& dCpeer) {
     const int world = a.world;
     CHECK_CUDA(cudaSetDevice(rank));
     cudaStream_t computeStream;
@@ -769,16 +768,19 @@ void dist_gemm_ce(const Args& a) {
         CHECK_CUDA(cudaMalloc(&dC, mSlice * a.N * sizeof(Element)));
         ptrs[i] = dC;
     }
-    std::vector<std::jthread> workers;
+    std::vector<std::thread> workers;
     workers.reserve(world);
     for (int i = 0; i < world; ++i) {
         // Capture by reference where appropriate; rank by value
         int rank = i;
         workers.emplace_back(
-            [&, rank](std::stop_token st) {
-                t_ce(st, a, sync_point, rank, ptrs);
+            [&, rank] {
+                t_ce(a, sync_point, rank, ptrs);
             }
         );
+    }
+    for (int i = 0; i < world; ++i) {
+        workers[i].join();
     }
 }
 // --------------------
