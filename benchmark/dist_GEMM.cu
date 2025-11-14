@@ -256,7 +256,7 @@ struct HalfGEMM {
     cublasLtMatrixLayout_t a_desc{}, b_desc{}, c_desc{};
     cublasLtMatmulPreference_t pref{};
     cublasLtMatmulHeuristicResult_t heuristic{};
-    void* workspace{}; size_t ws_bytes{32 * 1024 * 1024}; // 128MB
+    void* workspace{};
 
     __host__ __forceinline__
     void init(const int& M, const int& N, const int& K, void* _workspace) {
@@ -279,12 +279,6 @@ struct HalfGEMM {
         // i.e., opA = T on B_cm, opB = N on A_cm.
 
         // Descriptors
-        cublasLtMatrixLayout_t a_desc = nullptr;
-        cublasLtMatrixLayout_t b_desc = nullptr;
-        cublasLtMatrixLayout_t c_desc = nullptr;
-        cublasLtMatrixLayout_t d_desc = nullptr;
-        cublasLtMatmulPreference_t pref = nullptr;
-
         constexpr cublasComputeType_t compute     = CUBLAS_COMPUTE_32F;
         constexpr cudaDataType_t      dtype       = CUDA_R_16F;  // FP16 inputs/outputs
         constexpr cudaDataType_t      scale_dtype = CUDA_R_32F;  // FP32 scaling
@@ -294,8 +288,8 @@ struct HalfGEMM {
 
         // opA = T (B_cm^T gives N x K)
         // opB = N (A_cm gives K x M)
-        const cublasOperation_t opA = CUBLAS_OP_T;
-        const cublasOperation_t opB = CUBLAS_OP_N;
+        constexpr cublasOperation_t opA = CUBLAS_OP_T;
+        constexpr cublasOperation_t opB = CUBLAS_OP_N;
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
             op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(
@@ -326,11 +320,8 @@ struct HalfGEMM {
         const int cd_rows = N;
         const int cd_cols = M;
         const int ldc_cm  = ldC_rm;
-        const int ldd_cm  = ldC_rm;
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
             &c_desc, dtype, cd_rows, cd_cols, ldc_cm));
-        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(
-            &d_desc, dtype, cd_rows, cd_cols, ldd_cm));
 
         // 3) Preference / heuristic
         CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
@@ -343,7 +334,7 @@ struct HalfGEMM {
 
         int returned = 0;
         CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
-            lt, op_desc, a_desc, b_desc, c_desc, d_desc,
+            lt, op_desc, a_desc, b_desc, c_desc, c_desc,
             pref, 1, &heuristic, &returned));
         if (returned == 0) {
             fprintf(stderr, "cuBLASLt: no heuristic found.\n");
@@ -461,10 +452,6 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                     const auto peer = (rank + j) % world;
                     const int streamIdx = (j - 1) % nStreams;
                     auto* dCp = dCPeer[peer] + (rank * (M * N) + (i * mChunk * N));
-                    if (M == 128) {
-                        printf("Rank %d, chunk %d/%d, sending to PE %d, stream %d\n",
-                            rank, i, chunks, peer, streamIdx);
-                    }
                     const auto* dCx = dCL + i * (mChunk * N);
                     // transfer with CE
                     auto s = copyStreams[streamIdx];
@@ -632,13 +619,13 @@ void run_dist_gemm(const Args &a) {
                 nvshmemx_barrier_all_on_stream(computeStream);
             }
             CHECK_CUDA(cudaDeviceSynchronize());
-            CHECK_CUDA(cudaEventRecord(t_req_start));
+            CHECK_CUDA(cudaEventRecord(t_req_start, computeStream));
             for (int j = 0; j < a.iters; ++j) {
                 dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
                     copyStreams, gemmDone, gf, comm);
                 nvshmemx_barrier_all_on_stream(computeStream);
             }
-            CHECK_CUDA(cudaEventRecord(t_req_end));
+            CHECK_CUDA(cudaEventRecord(t_req_end, computeStream));
             CHECK_CUDA(cudaEventSynchronize(t_req_end));
             const auto e2e_ms = elapsed_ms(t_req_start, t_req_end);
             if (rank == 0) {
@@ -651,6 +638,11 @@ void run_dist_gemm(const Args &a) {
     CHECK_CUDA(cudaEventDestroy(t_req_start));
     CHECK_CUDA(cudaEventDestroy(t_req_end));
     CHECK_CUDA(cudaStreamSynchronize(computeStream));
+    CHECK_CUDA(cudaEventDestroy(gemmDone));
+    CHECK_CUDA(cudaFreeAsync(dAref, computeStream));
+    CHECK_CUDA(cudaFreeAsync(dCref, computeStream));
+    CHECK_CUDA(cudaFreeAsync(d_mis, computeStream));
+    CHECK_CUDA(cudaFreeAsync(workspaceRef, computeStream));
     CHECK_CUDA(cudaFreeAsync(workspace, computeStream));
     CHECK_CUDA(cudaFreeAsync(dA, computeStream));
     CHECK_CUDA(cudaFreeAsync(dB, computeStream));
@@ -677,10 +669,10 @@ void t_ce(const Args& a, std::barrier<>& b, std::atomic<int>& fm, const int rank
     int nCopyEngines = 0;
     CHECK_CUDA(cudaDeviceGetAttribute(&nCopyEngines, cudaDevAttrAsyncEngineCount, rank));
     std::vector<cudaStream_t> copyStreams(nCopyEngines);
-    for (auto &copyStream: copyStreams) {
+    for (int i = 0; i < nCopyEngines; ++i) {
         cudaStream_t s;
         CHECK_CUDA(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-        copyStream = s;
+        copyStreams[i] = s;
     }
 
     void *workspace = nullptr;
@@ -723,7 +715,7 @@ void t_ce(const Args& a, std::barrier<>& b, std::atomic<int>& fm, const int rank
     }
     auto* dC = dCpeer[rank];
     for (int m = a.M_min; m <= a.M_max; m *= a.step_factor) {
-        const auto mChunk = min(m / world, 8);
+        const auto mChunk = std::min(m / world, 8);
         HalfGEMM gf{};
         gf.init(mChunk, a.N, a.K, workspace);
         HalfGEMM gfRef{};
@@ -759,14 +751,14 @@ void t_ce(const Args& a, std::barrier<>& b, std::atomic<int>& fm, const int rank
             b.arrive_and_wait();
         }
         CHECK_CUDA(cudaDeviceSynchronize());
-        CHECK_CUDA(cudaEventRecord(t_req_start));
+        CHECK_CUDA(cudaEventRecord(t_req_start, computeStream));
         for (int j = 0; j < a.iters; ++j) {
             dist_gemm(DG_OVERLAP_MODE::CE, dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
                 copyStreams, gemmDone, gf, nullptr, dCpeer.data());
             CHECK_CUDA(cudaStreamSynchronize(computeStream));
             b.arrive_and_wait();
         }
-        CHECK_CUDA(cudaEventRecord(t_req_end));
+        CHECK_CUDA(cudaEventRecord(t_req_end, computeStream));
         CHECK_CUDA(cudaEventSynchronize(t_req_end));
         const auto e2e_ms = elapsed_ms(t_req_start, t_req_end);
         if (rank == 0) {
@@ -774,10 +766,16 @@ void t_ce(const Args& a, std::barrier<>& b, std::atomic<int>& fm, const int rank
                 e2e_ms / static_cast<float>(a.iters));
             fflush(stdout);
         }
+        CHECK_CUDA(cudaStreamSynchronize(computeStream));
     }
     CHECK_CUDA(cudaEventDestroy(t_req_start));
     CHECK_CUDA(cudaEventDestroy(t_req_end));
     CHECK_CUDA(cudaStreamSynchronize(computeStream));
+    CHECK_CUDA(cudaEventDestroy(gemmDone));
+    CHECK_CUDA(cudaFreeAsync(dAref, computeStream));
+    CHECK_CUDA(cudaFreeAsync(dCref, computeStream));
+    CHECK_CUDA(cudaFreeAsync(d_mis, computeStream));
+    CHECK_CUDA(cudaFreeAsync(workspaceRef, computeStream));
     CHECK_CUDA(cudaFreeAsync(workspace, computeStream));
     CHECK_CUDA(cudaFreeAsync(dA, computeStream));
     CHECK_CUDA(cudaFreeAsync(dB, computeStream));
@@ -791,7 +789,6 @@ void t_ce(const Args& a, std::barrier<>& b, std::atomic<int>& fm, const int rank
 __host__ __forceinline__
 void dist_gemm_ce(const Args& a) {
     const int world = a.world;
-    const auto mSlice = a.M_max / world;
     std::vector<Element*> ptrs (world);
     std::barrier sync_point(world);
     std::atomic<int> fm{0};
@@ -799,7 +796,7 @@ void dist_gemm_ce(const Args& a) {
         Element* dC = nullptr;
         CHECK_CUDA(cudaSetDevice(i));
         // malloc result array
-        CHECK_CUDA(cudaMalloc(&dC, mSlice * a.N * sizeof(Element)));
+        CHECK_CUDA(cudaMalloc(&dC, a.M_max * a.N * sizeof(Element)));
         ptrs[i] = dC;
     }
     std::vector<std::thread> workers(world);
@@ -819,6 +816,7 @@ void dist_gemm_ce(const Args& a) {
 // Main
 // --------------------
 int main(const int argc, char **argv) {
+    static_assert(ARCH >= 700);
     if (const auto a = parse_args(argc, argv); a.ce) {
         dist_gemm_ce(a);
     }
