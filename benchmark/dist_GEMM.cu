@@ -43,6 +43,7 @@ fprintf(stderr,"cuBLASLt error %s:%d: status=%d\n", __FILE__, __LINE__, int(s));
 // Args & parsing
 // --------------------
 struct Args {
+    int check = 1;
     int ce = 0;
     int world = 1;
     int M_min = 1024;
@@ -76,6 +77,7 @@ static Args parse_args(const int argc, char **argv) {
         else if (at("--step=", i)) a.step_factor = ctoi(val("--step=", i));
         else if (at("--world=", i)) a.world = ctoi(val("--world=", i));
         else if (at("--ce=", i)) a.ce = ctoi(val("--ce=", i));
+        else if (at("--check=", i)) a.ce = ctoi(val("--check=", i));
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             exit(0);
@@ -157,7 +159,7 @@ __global__ void fill_uniform_kernel(Element *__restrict__ out,
         __float22half2_rn(float2{r4.z, r4.w})};
     // Tail-safe stores
     if (n - base >= 4) {
-        reinterpret_cast<half4 *>(out)[tid] = v;
+        reinterpret_cast<half4*>(out)[tid] = v;
     } else {
         if (base + 0 < n) out[base + 0] = v.x.x;
         if (base + 1 < n) out[base + 1] = v.x.y;
@@ -285,8 +287,8 @@ void gemm_fp16_rowmajor_cublaslt(
     constexpr cudaDataType_t      dtype       = CUDA_R_16F;  // FP16 inputs/outputs
     constexpr cudaDataType_t      scale_dtype = CUDA_R_32F;  // FP32 scaling
 
-    float alpha = 1.0f;
-    float beta  = 0.0f;
+    constexpr float alpha = 1.0f;
+    constexpr float beta  = 0.0f;
 
     // 1) Matmul desc
     CUBLAS_CHECK(cublasLtMatmulDescCreate(&op_desc, compute, scale_dtype));
@@ -524,7 +526,6 @@ void teardown_nccl(ncclComm_t comm) {
     NCCL_CHECK(ncclCommFinalize(comm));
     NCCL_CHECK(ncclCommDestroy(comm));
 }
-
 __host__ __forceinline__
 void run_dist_gemm(const Args &a) {
     NVTX3_FUNC_RANGE();
@@ -569,11 +570,9 @@ void run_dist_gemm(const Args &a) {
     Element* dAref = nullptr;
     CHECK_CUDA(cudaMallocAsync(&dCref, a.M_max * a.N * sizeof(Element), computeStream));
     CHECK_CUDA(cudaMallocAsync(&dAref, a.M_max * a.K * sizeof(Element), computeStream));
-    for (int i = 0; i < world; ++i) {
-        auto* dAp = dAref + (i * mSlice * a.K);
-        const auto rSeed = 41 * (i + 1);
-        fill_uniform(dAp, mSlice * a.K, computeStream, rSeed);
-    }
+    unsigned long long* d_mis = nullptr;
+    CHECK_CUDA(cudaMallocAsync(&d_mis, sizeof(unsigned long long), computeStream));
+    CHECK_CUDA(cudaStreamSynchronize(computeStream));
     auto *__restrict__ dC = static_cast<Element*>(nvshmem_malloc(a.M_max * a.N * sizeof(Element)));
     constexpr auto mChunk = 4;
     if (a.M_min % (world * mChunk) != 0 || (mChunk * a.N) % COMM_BLOCKS != 0) {
@@ -582,31 +581,35 @@ void run_dist_gemm(const Args &a) {
         }
         return;
     }
-    unsigned long long* d_mis = nullptr;
-    CHECK_CUDA(cudaMallocAsync(&d_mis, sizeof(unsigned long long), computeStream));
     // Events
     cudaEvent_t t_req_start, t_req_end;
     CHECK_CUDA(cudaEventCreate(&t_req_start));
     CHECK_CUDA(cudaEventCreate(&t_req_end));
-
+    if (rank == 0) {
+        printf("case,correct?,world,M,N,K,E2E_ms\n");
+    }
+    float errorVal = 0.0f;
     for (int m = a.M_min; m <= a.M_max; m *= a.step_factor) {
-        constexpr auto nCases = 3;
+        constexpr auto nCases = 2;
         constexpr std::array cases{"NCCL-overlap", "NVSH-Host-overlap", "NVSH-Fused-overlap"};
         constexpr std::array dg_modes{DG_OVERLAP_MODE::NCCL,
             DG_OVERLAP_MODE::NVSH_HOST, DG_OVERLAP_MODE::NVSH_FUSED};
         #pragma unroll
         for (int c = 0; c < nCases; ++c) {
             // correctness check
-            dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
+            if (a.check) {
+                const int mLocal = m / world;
+                for (int r = 0; r < world; ++r) {
+                    auto* dAp = dAref + (r * mLocal * a.K);
+                    const auto rSeed = 41 * (r + 1);
+                    fill_uniform(dAp, mLocal * a.K, computeStream, rSeed);
+                }
+                dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
                     copyStreams, gemmDone, lt, workspace, comm);
-            nvshmemx_barrier_all_on_stream(computeStream);
-            gemm_fp16_rowmajor_cublaslt(lt, computeStream, m, a.N, a.K, dAref, dB, dCref, workspace);
-            const auto error = checkCorrectnessHost(dC, dCref, m * a.N, d_mis, computeStream);
-            if (rank == 0) {
-                printf("%s, error, %.2f %%, world,M,N,K,E2E_ms\n", cases[c], error);
-            }
-            else {
-                printf("%s, error, %.2f %%\n", cases[c], error);
+                nvshmemx_barrier_all_on_stream(computeStream);
+                gemm_fp16_rowmajor_cublaslt(lt, computeStream, m, a.N, a.K, dAref, dB, dCref, workspace);
+                auto error = checkCorrectnessHost(dC, dCref, m * a.N, d_mis, computeStream);
+                MPI_Allreduce(&error, &errorVal, 1, MPI_FLOAT, MPI_MAX, MPI_COMM_WORLD);
             }
             for (int i = 0; i < a.warmup_iters; ++i) {
                 dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, mChunk, rank, world, computeStream,
@@ -624,7 +627,7 @@ void run_dist_gemm(const Args &a) {
             CHECK_CUDA(cudaEventSynchronize(t_req_end));
             const auto e2e_ms = elapsed_ms(t_req_start, t_req_end);
             if (rank == 0) {
-                printf("%d,%d,%d,%d,%.4f\n", world, m, a.N, a.K,
+                printf("%s,%s,%d,%d,%d,%d,%.4f\n", cases[c], errorVal > 1e-3? "No" : "Yes", world, m, a.N, a.K,
                     e2e_ms / static_cast<float>(a.iters));
                 fflush(stdout);
             }
