@@ -388,7 +388,7 @@ void printMatrix(const __half* __restrict__ const& p, const int& M, const int& N
         printf("}\n");
     }
 }
-#define COMM_BLOCKS 8
+#define COMM_BLOCKS 32
 __host__ __forceinline__
 void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB, Element *dC,
                const int gM, const int M, const int N, const int K, const int mChunk,
@@ -450,7 +450,7 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                 for (int j = 1; j < world; ++j) {
                     const auto peer = (rank + j) % world;
                     const auto streamIdx = (j - 1) % copyStreams.size();
-                    auto* dCp = dCPeer[peer] + (peer * (M * N) + (i * mChunk * K));
+                    auto* dCp = dCPeer[peer] + (rank * (M * N) + (i * mChunk * K));
                     assert(dCp != nullptr);
                     const auto* dCx = dCL + i * (mChunk * N);
                     // transfer with CE
@@ -480,11 +480,10 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                 for (int j = 1; j < world; ++j) {
                     const auto peer = (rank + j) % world;
                     const auto streamIdx = (j - 1) % copyStreams.size();
-                    auto* dCp = dC + (peer * (M * N) + (i * mChunk * K));
-                    const auto* dCx = dCL + i * (mChunk * N);
+                    auto* dCx = dCL + i * (mChunk * N);
                     auto  s = copyStreams[streamIdx];
                     CHECK_CUDA(cudaStreamWaitEvent(s, gemmDone, 0));
-                    put<<<COMM_BLOCKS, 128, 0, s>>>(reinterpret_cast<cuda::std::byte*>(dCp),
+                    put<<<COMM_BLOCKS, 128, 0, s>>>(reinterpret_cast<cuda::std::byte*>(dCx),
                         reinterpret_cast<const cuda::std::byte*>(dCx), peer,
                         static_cast<long int>(sizeof(Element) * partition));
                 }
