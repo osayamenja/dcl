@@ -56,6 +56,29 @@ function(dcl_target_common tgt)
         target_link_libraries(${tgt} PRIVATE "${MSCCLPP}" MPI::MPI_CXX)
         target_include_directories(${tgt} PRIVATE "$ENV{MSCCLPP_HOME}/include")
     endif ()
+    if(${tgt} STREQUAL "nx")
+        find_package(Torch REQUIRED HINTS "$ENV{TORCH_ROOT}")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+        target_link_libraries(${tgt} PRIVATE "${TORCH_LIBRARIES}")
+        find_library(TORCHCOMMS
+                NAMES libtorchcomms.so
+                HINTS "$ENV{TORCH_COMM_ROOT}/lib"
+                REQUIRED
+        )
+        target_link_libraries(${tgt} PRIVATE "${TORCHCOMMS}")
+        # NCCLX Backend
+        set_target_properties(${tgt} PROPERTIES
+                BUILD_RPATH "$ENV{TORCH_COMM_ROOT}/lib"
+        )
+        set(COMMS_NCCLX_SO
+                "$ENV{TORCH_COMM_ROOT}/lib/_comms_ncclx.cpython-312-x86_64-linux-gnu.so"
+        )
+        if (NOT EXISTS "${COMMS_NCCLX_SO}")
+            message(FATAL_ERROR "Cannot find _comms_ncclx at: ${COMMS_NCCLX_SO}")
+        endif ()
+        target_link_libraries(${tgt} PRIVATE "${COMMS_NCCLX_SO}")
+        target_include_directories(${tgt} PRIVATE "$ENV{TORCH_COMM_ROOT}/include")
+    endif ()
 
     # Modern arch setting on the target itself
     set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES "native")
@@ -101,3 +124,8 @@ add_executable(dg
         benchmark/dist_GEMM.cu
 )
 dcl_target_common(dg)
+# NCCLX
+add_executable(nx
+        benchmark/ncclx_bench.cu
+)
+dcl_target_common(nx)
