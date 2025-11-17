@@ -1,6 +1,5 @@
 #include <array>
 #include <barrier>
-#include <limits>
 #include <thread>
 
 #include <cuda_runtime.h>
@@ -401,6 +400,11 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
                const std::vector<cudaStream_t>& copyStreams, cudaEvent_t gemmDone,
                const HalfGEMM& gf, ncclComm_t comm, Element* const* dCPeer = nullptr) {
     NVTX3_FUNC_RANGE();
+    if (world == 1) {
+        // do singular GEMM
+        gf.run(computeStream, dA, dB, dC);
+        return;
+    }
     const int chunks = M / mChunk;
     auto* dCL = dC + rank * (M * N);
     switch (mode) {
@@ -581,13 +585,19 @@ void run_dist_gemm(const Args &a) {
             continue;
         }
         HalfGEMM gf{};
-        gf.init(a.chunk, a.N, a.K, workspace);
+        const auto mG = world > 1 ? a.chunk : m;
+        gf.init(mG, a.N, a.K, workspace);
         HalfGEMM gfRef{};
         gfRef.init(m, a.N, a.K, workspaceRef);
         constexpr auto nCases = 2;
         constexpr std::array cases{"NCCL-overlap", "NVSH-Host-overlap", "NVSH-Fused-overlap"};
         constexpr std::array dg_modes{DG_OVERLAP_MODE::NCCL,
             DG_OVERLAP_MODE::NVSH_HOST, DG_OVERLAP_MODE::NVSH_FUSED};
+        auto barrier_on_stream = [&world](cudaStream_t stream) {
+            if (world > 1) {
+                nvshmemx_barrier_all_on_stream(stream);
+            }
+        };
         #pragma unroll
         for (int c = 0; c < nCases; ++c) {
             // correctness check
@@ -598,25 +608,25 @@ void run_dist_gemm(const Args &a) {
                     const auto rSeed = 41 * (r + 1);
                     fill_uniform(dAp, mLocal * a.K, computeStream, rSeed);
                 }
-                nvshmemx_barrier_all_on_stream(computeStream);
+                barrier_on_stream(computeStream);
                 dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, a.chunk, rank, world, computeStream,
                     copyStreams, gemmDone, gf, comm);
                 gfRef.run(computeStream, dAref, dB, dCref);
-                nvshmemx_barrier_all_on_stream(computeStream);
+                barrier_on_stream(computeStream);
                 auto error = checkCorrectnessHost(dC, dCref, m * a.N, d_mis, computeStream);
                 MPI_Allreduce(&error, &errorVal, 1, MPI_FLOAT, MPI_MAX, MPI_COMM_WORLD);
             }
             for (int i = 0; i < a.warmup_iters; ++i) {
                 dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, a.chunk, rank, world, computeStream,
                     copyStreams, gemmDone, gf, comm);
-                nvshmemx_barrier_all_on_stream(computeStream);
+                barrier_on_stream(computeStream);
             }
             CHECK_CUDA(cudaDeviceSynchronize());
             CHECK_CUDA(cudaEventRecord(t_req_start, computeStream));
             for (int j = 0; j < a.iters; ++j) {
                 dist_gemm(dg_modes[c], dA, dB, dC, m, m / world, a.N, a.K, a.chunk, rank, world, computeStream,
                     copyStreams, gemmDone, gf, comm);
-                nvshmemx_barrier_all_on_stream(computeStream);
+                barrier_on_stream(computeStream);
             }
             CHECK_CUDA(cudaEventRecord(t_req_end, computeStream));
             CHECK_CUDA(cudaEventSynchronize(t_req_end));
@@ -716,9 +726,21 @@ void t_ce(const Args& a, std::barrier<>& b, std::atomic<int>& fm, const int rank
             continue;
         }
         HalfGEMM gf{};
-        gf.init(a.chunk, a.N, a.K, workspace);
+        const auto mG = world > 1 ? a.chunk : m;
+        gf.init(mG, a.N, a.K, workspace);
         HalfGEMM gfRef{};
         gfRef.init(m, a.N, a.K, workspaceRef);
+        auto barrier_x = [&world, &b]() {
+            if (world > 1) {
+                b.arrive_and_wait();
+            }
+        };
+        auto barrier_on_stream = [&world, &b](cudaStream_t stream) {
+            if (world > 1) {
+                CHECK_CUDA(cudaStreamSynchronize(stream));
+                b.arrive_and_wait();
+            }
+        };
         // correctness check
         bool correct = true;
         if (a.check) {
@@ -728,18 +750,16 @@ void t_ce(const Args& a, std::barrier<>& b, std::atomic<int>& fm, const int rank
                 const auto rSeed = 41 * (r + 1);
                 fill_uniform(dAp, mLocal * a.K, computeStream, rSeed);
             }
-            b.arrive_and_wait();
+            barrier_x();
             dist_gemm(DG_OVERLAP_MODE::CE, dA, dB, dC, m, m / world, a.N, a.K, a.chunk, rank, world, computeStream,
                 copyStreams, gemmDone, gf, nullptr, dCpeer.data());
             gfRef.run(computeStream, dAref, dB, dCref);
-            CHECK_CUDA(cudaStreamSynchronize(computeStream));
-            b.arrive_and_wait();
+            barrier_on_stream(computeStream);
             const auto error = checkCorrectnessHost(dC, dCref, m * a.N, d_mis, computeStream);
-            b.arrive_and_wait();
             if (error > 1e-3) {
                 ++fm;
             }
-            b.arrive_and_wait();
+            barrier_x();
             if (fm.load() > 0) {
                 correct = false;
                 fm.store(0);
@@ -748,16 +768,14 @@ void t_ce(const Args& a, std::barrier<>& b, std::atomic<int>& fm, const int rank
         for (int i = 0; i < a.warmup_iters; ++i) {
             dist_gemm(DG_OVERLAP_MODE::CE, dA, dB, dC, m, m / world, a.N, a.K, a.chunk, rank, world, computeStream,
                 copyStreams, gemmDone, gf, nullptr, dCpeer.data());
-            CHECK_CUDA(cudaStreamSynchronize(computeStream));
-            b.arrive_and_wait();
+            barrier_on_stream(computeStream);
         }
         CHECK_CUDA(cudaDeviceSynchronize());
         CHECK_CUDA(cudaEventRecord(t_req_start, computeStream));
         for (int j = 0; j < a.iters; ++j) {
             dist_gemm(DG_OVERLAP_MODE::CE, dA, dB, dC, m, m / world, a.N, a.K, a.chunk, rank, world, computeStream,
                 copyStreams, gemmDone, gf, nullptr, dCpeer.data());
-            CHECK_CUDA(cudaStreamSynchronize(computeStream));
-            b.arrive_and_wait();
+            barrier_on_stream(computeStream);
         }
         CHECK_CUDA(cudaEventRecord(t_req_end, computeStream));
         CHECK_CUDA(cudaEventSynchronize(t_req_end));
