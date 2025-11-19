@@ -5,3 +5,4 @@ cmake-build-*
 
 *.nsys-rep
 benchmark/.venv/
+benchmark/.idea

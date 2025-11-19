@@ -11,7 +11,6 @@
 
 #include <cuda_runtime.h>
 
-// MSCCL++ headers (installed by `make install`)
 #include <mscclpp/core.hpp>
 #include <mscclpp/memory_channel.hpp>
 #include <mscclpp/semaphore.hpp>

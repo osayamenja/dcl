@@ -20,10 +20,16 @@ include(CheckCompilerFlag)
 find_package(CUDAToolkit REQUIRED)
 find_package(MPI REQUIRED COMPONENTS CXX)
 find_package(NVSHMEM REQUIRED HINTS "$ENV{NVSHMEM_HOME}/lib/cmake/nvshmem")
+find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 string(SUBSTRING "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" 0 2 COMPUTE_CAPABILITY) # xx-real -> xx
 math(EXPR GPU_ARCH "${COMPUTE_CAPABILITY} * 10" OUTPUT_FORMAT DECIMAL)
 message(STATUS "GPU Compute Capability: ${COMPUTE_CAPABILITY}")
+find_library(NCCL
+        NAMES libnccl_static.a
+        REQUIRED
+)
+find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
 
 function(dcl_target_common tgt)
     target_link_libraries(${tgt} PRIVATE
@@ -39,11 +45,6 @@ function(dcl_target_common tgt)
         )
     endif ()
     if(${tgt} STREQUAL "dg")
-        find_library(NCCL
-                NAMES libnccl_static.a
-                REQUIRED
-        )
-        find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
         target_link_libraries(${tgt} PRIVATE mathdx::cublasdx)
         target_link_libraries(${tgt} PRIVATE MPI::MPI_CXX CUDA::cublasLt "${NCCL}")
     endif ()
@@ -55,29 +56,6 @@ function(dcl_target_common tgt)
         )
         target_link_libraries(${tgt} PRIVATE "${MSCCLPP}" MPI::MPI_CXX)
         target_include_directories(${tgt} PRIVATE "$ENV{MSCCLPP_HOME}/include")
-    endif ()
-    if(${tgt} STREQUAL "nx")
-        find_package(Torch REQUIRED HINTS "$ENV{TORCH_ROOT}")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
-        target_link_libraries(${tgt} PRIVATE "${TORCH_LIBRARIES}")
-        find_library(TORCHCOMMS
-                NAMES libtorchcomms.so
-                HINTS "$ENV{TORCH_COMM_ROOT}/lib"
-                REQUIRED
-        )
-        target_link_libraries(${tgt} PRIVATE "${TORCHCOMMS}")
-        # NCCLX Backend
-        set_target_properties(${tgt} PROPERTIES
-                BUILD_RPATH "$ENV{TORCH_COMM_ROOT}/lib"
-        )
-        set(COMMS_NCCLX_SO
-                "$ENV{TORCH_COMM_ROOT}/lib/_comms_ncclx.cpython-312-x86_64-linux-gnu.so"
-        )
-        if (NOT EXISTS "${COMMS_NCCLX_SO}")
-            message(FATAL_ERROR "Cannot find _comms_ncclx at: ${COMMS_NCCLX_SO}")
-        endif ()
-        target_link_libraries(${tgt} PRIVATE "${COMMS_NCCLX_SO}")
-        target_include_directories(${tgt} PRIVATE "$ENV{TORCH_COMM_ROOT}/include")
     endif ()
 
     # Modern arch setting on the target itself
@@ -119,13 +97,8 @@ add_executable(ms
         benchmark/mscclpp_bench.cu
 )
 dcl_target_common(ms)
-# TP AG
+# Distributed GEMM or GEMM+AG
 add_executable(dg
         benchmark/dist_GEMM.cu
 )
 dcl_target_common(dg)
-# NCCLX
-add_executable(nx
-        benchmark/ncclx_bench.cu
-)
-dcl_target_common(nx)
