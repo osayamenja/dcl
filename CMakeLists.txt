@@ -18,6 +18,13 @@ set(CMAKE_CUDA_FLAGS "-Xfatbin -compress-all -Xcudafe --display_error_number -Xc
 
 include(CheckCompilerFlag)
 find_package(CUDAToolkit REQUIRED)
+set(ENV{CPM_SOURCE_CACHE} "./cmake/cache")
+include(cmake/CPM.cmake)
+CPMAddPackage(
+        NAME CCCL
+        GITHUB_REPOSITORY nvidia/cccl
+        VERSION 3.1.2
+)
 find_package(MPI REQUIRED COMPONENTS CXX)
 find_package(NVSHMEM REQUIRED HINTS "$ENV{NVSHMEM_HOME}/lib/cmake/nvshmem")
 find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
@@ -37,6 +44,9 @@ function(dcl_target_common tgt)
             CUDA::cuda_driver
             CUDA::nvtx3
     )
+    if(CCCL_ADDED AND CUDAToolkit_VERSION_MAJOR GREATER 12 AND CUDAToolkit_VERSION_MINOR LESS 2)
+        target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
+    endif()
     if(${tgt} STREQUAL "nvsh" OR ${tgt} STREQUAL "dg")
         target_link_libraries(${tgt} PRIVATE nvshmem::nvshmem)
         set_target_properties(${tgt} PROPERTIES
@@ -100,5 +110,6 @@ dcl_target_common(ms)
 # Distributed GEMM or GEMM+AG
 add_executable(dg
         benchmark/dist_GEMM.cu
+        benchmark/dgk.cuh
 )
 dcl_target_common(dg)
