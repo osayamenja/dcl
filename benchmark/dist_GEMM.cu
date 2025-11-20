@@ -482,7 +482,7 @@ void dist_gemm(const DG_OVERLAP_MODE mode, const Element *dA, const Element *dB,
         case DG_OVERLAP_MODE::NVSH_FUSED: {
             nvtx3::scoped_range fused{"NVSH-FUSED"};
             // within a fused kernel, overlap GEMM and tile-level communication
-            dgk<<<1, FUSED_THREADS, 0, computeStream>>>(dA, dB, dC, nullptr, gM, N, K, rank, world);
+            dgk<<<blocks, FUSED_THREADS, 0, computeStream>>>(dA, dB, dC, nullptr, gM, N, K, rank, world);
         }
             break;
     }

@@ -58,6 +58,9 @@ function(dcl_target_common tgt)
         target_link_libraries(${tgt} PRIVATE mathdx::cublasdx)
         target_link_libraries(${tgt} PRIVATE MPI::MPI_CXX CUDA::cublasLt "${NCCL}")
     endif ()
+    if (${tgt} STREQUAL "play")
+        target_link_libraries(${tgt} PRIVATE mathdx::cublasdx)
+    endif ()
     if(${tgt} STREQUAL "ms")
         find_library(MSCCLPP
                 NAMES libmscclpp.so
@@ -73,15 +76,16 @@ function(dcl_target_common tgt)
 
     target_compile_options(${tgt} PRIVATE
             $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g>
-            $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-O0;-g;-G;--generate-line-info;-Xptxas=-v>
+            $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-O0;-g;-G;--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
             $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
-            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--generate-line-info;-Xptxas=-v>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
     )
     target_compile_definitions(${tgt} PRIVATE ARCH=${GPU_ARCH})
 endfunction()
 
 # Playground for experimentation
 add_executable(play
+        benchmark/dgk.cuh
         main.cu
 )
 dcl_target_common(play)
