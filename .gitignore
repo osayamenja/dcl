@@ -7,3 +7,6 @@ cmake-build-*
 benchmark/.venv/
 benchmark/.idea
 cmake/*
+
+benchmark/pysrc/.idea
+benchmark/pysrc/.venv

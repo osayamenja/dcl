@@ -38,6 +38,26 @@ find_library(NCCL
 )
 find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
 
+function(dcl_example_target tgt)
+    target_link_libraries(${tgt} PRIVATE
+            CUDA::cudart
+            CUDA::cuda_driver
+            CUDA::nvtx3
+            MPI::MPI_CXX
+    )
+    if(CCCL_ADDED AND CUDAToolkit_VERSION_MAJOR GREATER 12 AND CUDAToolkit_VERSION_MINOR LESS 2)
+        target_link_libraries(${tgt} PRIVATE CCCL::CCCL)
+    endif()
+    set_property(TARGET ${tgt} PROPERTY CUDA_ARCHITECTURES "native")
+    target_compile_options(${tgt} PRIVATE
+            $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:-O0;-g>
+            $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-O0;-g;-G;--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:-O3>
+            $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--expt-relaxed-constexpr;--generate-line-info;-Xptxas=-v>
+    )
+    target_compile_definitions(${tgt} PRIVATE ARCH=${GPU_ARCH})
+endfunction()
+
 function(dcl_target_common tgt)
     target_link_libraries(${tgt} PRIVATE
             CUDA::cudart
@@ -82,14 +102,13 @@ function(dcl_target_common tgt)
     )
     target_compile_definitions(${tgt} PRIVATE ARCH=${GPU_ARCH})
 endfunction()
-
-# Playground for experimentation
-add_executable(play
-        benchmark/csrc/dgk.cuh
-        main.cu
+## examples
+add_executable(bt
+        examples/bootstrap.cu
+        include/dcl/bootstrap.cuh
+        include/dcl/dcl.cuh
 )
-dcl_target_common(play)
-
+dcl_example_target(bt)
 ## Benchmarks
 # copy engine via cudaMemcpyPeerAsync
 add_executable(ce
