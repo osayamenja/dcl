@@ -9,9 +9,13 @@
 #include <cublasLt.h>
 #include <nvtx3/nvtx3.hpp>
 
+#include <mscclpp/core.hpp>
+#include <mscclpp/memory_channel.hpp>
+#include <mscclpp/semaphore.hpp>
+
 // mathdx
 #include <curanddx.hpp>
-#include "dgk.cuh"
+#include "../dgk.cuh"
 
 #define MAX_COPY_ENGINE 8
 #define CHECK_CUDA(x) do{cudaError_t e=(x); if(e!=cudaSuccess){ \

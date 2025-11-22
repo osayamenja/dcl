@@ -85,7 +85,7 @@ endfunction()
 
 # Playground for experimentation
 add_executable(play
-        benchmark/dgk.cuh
+        benchmark/csrc/dgk.cuh
         main.cu
 )
 dcl_target_common(play)
@@ -93,27 +93,27 @@ dcl_target_common(play)
 ## Benchmarks
 # copy engine via cudaMemcpyPeerAsync
 add_executable(ce
-        benchmark/copy_engine_bench.cu
+        benchmark/csrc/copy_engine_bench.cu
 )
 dcl_target_common(ce)
 # ld,st latency
 add_executable(ldst
-        benchmark/ldst_latency.cu
+        benchmark/csrc/ldst_latency.cu
 )
 dcl_target_common(ldst)
 # NVSHMEM Bench
 add_executable(nvsh
-        benchmark/nvshmem_bench.cu
+        benchmark/csrc/nvshmem_bench.cu
 )
 dcl_target_common(nvsh)
 # MSCCLPP Bench
 add_executable(ms
-        benchmark/mscclpp_bench.cu
+        benchmark/csrc/mscclpp_bench.cu
 )
 dcl_target_common(ms)
 # Distributed GEMM or GEMM+AG
 add_executable(dg
-        benchmark/dist_GEMM.cu
-        benchmark/dgk.cuh
+        benchmark/csrc/dist_GEMM.cu
+        benchmark/csrc/dgk.cuh
 )
 dcl_target_common(dg)

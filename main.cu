@@ -1,6 +1,5 @@
 #include <iostream>
-
-#include "benchmark/dgk.cuh"
+#include "benchmark/csrc/dgk.cuh"
 #define CHECK_CUDA(x) do{cudaError_t e=(x); if(e!=cudaSuccess){ \
 fprintf(stderr,"CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1);} \
 }while(0)
@@ -36,11 +35,12 @@ void cdx() {
     dA[1] = 1.f;
     dA[0 + K] = 2.f;
     dA[1 + K] = 3.f;
-
+    printMatrix(dA, M ,K);
     dB[0] = 4.f;
     dB[1] = 5.f;
     dB[0 + K] = 6.f;
     dB[1 + K] = 7.f;
+    printMatrix(dB, K ,N);
 
     dgk<<<1, FUSED_THREADS, 0, stream>>>(dA, dB, dC, nullptr, M, N, K, 0, 1);
     CHECK_CUDA(cudaStreamSynchronize(stream));
@@ -51,6 +51,6 @@ void cdx() {
     CHECK_CUDA(cudaStreamDestroy(stream));
 }
 int main() {
-    std::cout << "Hello, World!" << std::endl;
+    cdx();
     return 0;
 }
