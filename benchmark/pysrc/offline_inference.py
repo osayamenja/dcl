@@ -37,6 +37,7 @@ class HFInferenceServer:
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
+            tp_plan="auto"
         )
         self.model.to(self.device)
         self.model.eval()
@@ -49,7 +50,7 @@ class HFInferenceServer:
 
         print("# Model and tokenizer ready.")
 
-    @nvtx.annotate(color="blue")
+
     @torch.no_grad()
     def run_once(
         self,
@@ -292,13 +293,14 @@ def run_benchmark(
             )
 
         for it in range(iterations):
-            res = server.run_once(
-                prompt=prompt,
-                max_new_tokens=max_nt,
-                temperature=temperature,
-                top_k=top_k,
-                return_text=(print_text and it == iterations - 1),
-            )
+            with nvtx.annotate("Generate", color="green"):
+                res = server.run_once(
+                    prompt=prompt,
+                    max_new_tokens=max_nt,
+                    temperature=temperature,
+                    top_k=top_k,
+                    return_text=(print_text and it == iterations - 1),
+                )
             prefill_vals.append(res["prefill_ms"])
             ttft_vals.append(res["ttft_ms"])
             tpot_vals.append(res["avg_token_ms"])
@@ -360,8 +362,8 @@ def parse_args():
     p.add_argument(
         "--model-name",
         type=str,
-        default="meta-llama/Meta-Llama-3.1-8B-Instruct",
-        help="HF model name or path (default: Llama-3.1-8B-Instruct)",
+        default="meta-llama/Meta-Llama-3.1-8B",
+        help="HF model name or path (default: Llama-3.1-8B)",
     )
     p.add_argument(
         "--device",
@@ -447,3 +449,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    torch.distributed.destroy_process_group()
