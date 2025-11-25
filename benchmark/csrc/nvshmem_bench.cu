@@ -1,9 +1,6 @@
 // nvshmem_put_device_min.cu
 // Minimal device-side NVSHMEM put benchmark.
 // Used for investigating emitted instructions
-// Measures per-iteration latency of: put_nbi_block + quiet
-// Prints: bytes,iters,total_us,avg_us,GBps,cycles_per_iter
-//
 
 #include <nvshmem.h>
 #include <nvshmemx.h>
@@ -26,8 +23,22 @@ void bw_v2(double* __restrict__ dst, const double* __restrict__ src,
                                        int* __restrict__ checkpoint)
 {
     const auto sOff = blockIdx.x * partition;
-    for (int i = 0; i < iters; i++) {
+    auto gridSync = [&checkpoint](const int& epoch)
+    {
+        __threadfence();
+        const auto expected = (epoch + 1) * gridDim.x;
+        bool checkAgain = atomicAdd(checkpoint, 1) + 1 < expected;
+        while (checkAgain) {
+            checkAgain = atomicAdd(checkpoint, 0) < expected;
+        }
+    };
+    for (int i = 0; i < iters; ++i) {
         nvshmemx_double_put_nbi_block(dst + sOff, src + sOff, partition, peer);
+        __syncthreads();
+        if (!threadIdx.x) {
+            gridSync(i);
+        }
+        __syncthreads();
     }
     __syncthreads();
     if (!threadIdx.x) {
@@ -42,9 +53,9 @@ auto parseSize(const std::string& s) {
     if (sscanf(s.c_str(), "%lf%c", &val, &unit) >= 1) {
         size_t mult = 1;
         switch (unit) {
-            case 'k': case 'K': mult = 1024ull; break;
-            case 'm': case 'M': mult = 1024ull * 1024ull; break;
-            case 'g': case 'G': mult = 1024ull * 1024ull * 1024ull; break;
+            case 'k': case 'K': mult = 1000ull; break;
+            case 'm': case 'M': mult = 1000ull * 1000ull; break;
+            case 'g': case 'G': mult = 1000ull * 1000ull * 1000ull; break;
             default: mult = 1; break;
         }
         if (unit == 0 || (unit != 'K' && unit != 'k' && unit != 'M' && unit != 'm' && unit != 'G' && unit != 'g')) {

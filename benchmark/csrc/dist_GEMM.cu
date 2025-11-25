@@ -15,7 +15,7 @@
 
 // mathdx
 #include <curanddx.hpp>
-#include "../dgk.cuh"
+#include "dgk.cuh"
 
 #define MAX_COPY_ENGINE 8
 #define CHECK_CUDA(x) do{cudaError_t e=(x); if(e!=cudaSuccess){ \

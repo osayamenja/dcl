@@ -66,9 +66,9 @@ static size_t parse_size(std::string s) {
   if (!s.empty()) suffix = static_cast<decltype(suffix)>(std::toupper(s.back()));
   size_t mul = 1;
   if (suffix=='K' || suffix=='M' || suffix=='G') s.pop_back();
-  if (suffix=='K') mul = 1024ULL;
-  else if (suffix=='M') mul = 1024ULL*1024ULL;
-  else if (suffix=='G') mul = 1024ULL*1024ULL*1024ULL;
+  if (suffix=='K') mul = 1000ULL;
+  else if (suffix=='M') mul = 1000ULL*1000ULL;
+  else if (suffix=='G') mul = 1000ULL*1000ULL*1000ULL;
   return static_cast<size_t>(std::stoll(s)) * mul;
 }
 
