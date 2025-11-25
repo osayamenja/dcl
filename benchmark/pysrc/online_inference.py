@@ -33,7 +33,7 @@ class HFInferenceServer:
         print(f"Loading model for {model_name} on {self.device}...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
+            dtype=torch.float16 if self.device.type == "cuda" else torch.float32,
         )
         self.model.to(self.device)
         self.model.eval()
@@ -241,7 +241,7 @@ class HFInferenceServer:
 def main():
     # You can change this to a Llama-3.x model once you're ready, e.g.:
     #   model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
-    model_name = "gpt2"
+    model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"
     server = HFInferenceServer(model_name=model_name)
 
     print("\nHF inference server ready. Type a prompt (or 'exit').\n")
