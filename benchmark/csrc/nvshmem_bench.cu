@@ -22,7 +22,7 @@ template<int Size>
 __device__ __forceinline__
 void cp_async_global_to_shared(void* __restrict__ const& smem_ptr, const void* __restrict__ const& gmem_ptr) {
     static_assert(Size == 4 || Size == 8 || Size == 16,
-                  "cp.async only supports Size ∈ {4, 8, 16}");
+                  "cp.async only supports Size in {4, 8, 16}");
     uint32_t sp = __cvta_generic_to_shared(smem_ptr);
 #if __CUDA_ARCH__ >= 900
     // Hopper, Blackwell, etc. (SM90+)
@@ -279,7 +279,7 @@ void kx_test() {
     constexpr int elements = size / sizeof(int);
     std::ranges::fill(fh, fh + elements, v);
     CUDA_CHECK(cudaMemcpyAsync(src, fh, size, cudaMemcpyHostToDevice, stream));
-    constexpr auto threads = 128;
+    constexpr auto threads = 256;
     constexpr auto Alignment = 16;
     constexpr auto stages = 2;
     constexpr auto stageExtent = 2;
@@ -305,6 +305,8 @@ void kx_test() {
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
+
+#define MAX_ALIGNMENT 16
 void bench(int argc, char** argv) {
     const auto args = parseArgs(argc, argv);
 
@@ -363,10 +365,9 @@ void bench(int argc, char** argv) {
             // Warmup a few iterations (device-side)
             const long int partition = static_cast<long int>(nBytes / sizeof(Element)) / args.ctas;
             bw_v2<<<args.ctas,args.threads, 0, stream>>>(dst, src, partition, peer, args.warmup, checkpoint);
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-
             CUDA_CHECK(cudaMemsetAsync(checkpoint, 0, sizeof(int), stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
+
             // Timed loop
             CUDA_CHECK(cudaEventRecord(start));
             bw_v2<<<args.ctas, args.threads, 0, stream>>>(dst, src, partition, peer, args.iters, checkpoint);
@@ -400,7 +401,114 @@ void bench(int argc, char** argv) {
     CUDA_CHECK(cudaStreamDestroy(stream));
     nvshmem_finalize();
 }
-int main(void) {
-    kx_test();
+
+template<int threads = 256, int stages = 2, int stageExtent = 2, int Alignment = 16>
+void kxBench(int argc, char** argv) {
+    const auto args = parseArgs(argc, argv);
+
+    // Choose CUDA device for this PE via init_attr (recommended).
+    nvshmem_init();  // minimal init
+
+    const int mype = nvshmem_my_pe();
+    const int npes = nvshmem_n_pes();
+    if (npes < 2) {
+        if (mype == 0) fprintf(stderr, "Need >= 2 PEs\n");
+        nvshmem_finalize(); return;
+    }
+
+    const int dev = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
+    CUDA_CHECK(cudaSetDevice(dev));
+
+    cudaDeviceProp deviceProp{};
+    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, dev));
+
+    // Symmetric buffers (max size)
+    using Element = cuda::std::byte;
+    auto* src = static_cast<Element*>(nvshmem_malloc(args.maxBytes));
+    auto* dst = static_cast<Element*>(nvshmem_malloc(args.maxBytes));
+    if (!src || !dst) {
+        fprintf(stderr, "PE %d: nvshmem_malloc failed\n", mype);
+        nvshmem_finalize(); return;
+    }
+    if (args.minBytes % MAX_ALIGNMENT != 0) {
+        if (!mype) {
+            fprintf(stderr, "min Bytes should be a multiple of 16\n");
+        }
+        nvshmem_finalize(); return;
+    }
+
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaMemsetAsync(src, 0xAB, args.maxBytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(dst, 0x00, args.maxBytes, stream));
+
+    const int peer = (mype + 1) % npes;
+
+    if (mype == 0) {
+        printf("# device-side NVSHMEM put benchmark (block API)\n");
+        printf("# npes=%d, device=%s, iters=%d\n", npes, deviceProp.name, args.iters);
+        printf("bytes,iters,total_us,avg_us,GBps\n");
+    }
+
+    // Device buffers for timing
+    int* checkpoint = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&checkpoint, sizeof(int), stream));
+    // Benchmark over sizes
+    float milliseconds;
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    if (!mype) {
+        for (auto nBytes = args.minBytes; nBytes <= args.maxBytes; nBytes *= args.step) {
+            // Sync all PEs and streams before measuring this size
+            nvshmemx_barrier_all_on_stream(stream);
+            CUDA_CHECK(cudaMemsetAsync(checkpoint, 0, sizeof(int), stream));
+            const int ec = static_cast<int>(args.minBytes / MAX_ALIGNMENT);
+            const auto blocks = min(ec, args.ctas);
+
+            // Warmup a few iterations (device-side)
+            const long int partition = static_cast<long int>(nBytes / sizeof(Element)) / blocks;
+            bw_v3<threads, stages, stageExtent, Alignment><<<blocks, threads, 0, stream>>>
+            (dst, src, partition, 1, args.iters, checkpoint);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            CUDA_CHECK(cudaMemsetAsync(checkpoint, 0, sizeof(int), stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // Timed loop
+            CUDA_CHECK(cudaEventRecord(start));
+            bw_v3<threads, stages, stageExtent, Alignment><<<blocks, threads, 0, stream>>>
+            (dst, src, partition, 1, args.iters, checkpoint);
+            CUDA_CHECK(cudaEventRecord(stop));
+            CUDA_CHECK(cudaEventSynchronize(stop));
+            CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+
+            //const auto total_us = to_us_from_cycles(cycles, ghz);
+            const auto avg_us = (static_cast<double>(milliseconds) / args.iters) * 1000.0;
+            const auto bytes_GB = static_cast<double>(nBytes) / B_TO_GB;
+            const auto GBps= bytes_GB / (avg_us / 1e6);
+
+            if (mype == 0) {
+                printf("%zu,%d,%.2f,%.2f\n",
+                       nBytes, args.iters, avg_us, GBps);
+                fflush(stdout);
+            }
+        }
+    }
+    else {
+        for (auto nBytes = args.minBytes; nBytes <= args.maxBytes; nBytes *= args.step) {
+            nvshmemx_barrier_all_on_stream(stream);
+        }
+    }
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    nvshmem_free(src);
+    nvshmem_free(dst);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    nvshmem_finalize();
+}
+int main(int argc, char** argv) {
+    kxBench(argc, argv);
     return 0;
 }
