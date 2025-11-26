@@ -28,9 +28,9 @@ size_t parseSize(const std::string& s) {
     if (sscanf(s.c_str(), "%lf%c", &val, &unit) >= 1) {
         size_t mult = 1;
         switch (unit) {
-            case 'k': case 'K': mult = 1000ull; break;
-            case 'm': case 'M': mult = 1000ull * 1000ull; break;
-            case 'g': case 'G': mult = 1000ull * 1000ull * 1000ull; break;
+            case 'k': case 'K': mult = 1024ull; break;
+            case 'm': case 'M': mult = 1024ull * 1024ull; break;
+            case 'g': case 'G': mult = 1024ull * 1024ull * 1024ull; break;
             default: mult = 1; break;
         }
         if (unit == 0 || (unit != 'K' && unit != 'k' && unit != 'M' && unit != 'm' && unit != 'G' && unit != 'g')) {

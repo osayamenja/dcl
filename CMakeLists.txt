@@ -20,6 +20,9 @@ include(CheckCompilerFlag)
 find_package(CUDAToolkit REQUIRED)
 set(ENV{CPM_SOURCE_CACHE} "./cmake/cache")
 include(cmake/CPM.cmake)
+string(SUBSTRING "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" 0 2 COMPUTE_CAPABILITY) # xx-real -> xx
+math(EXPR GPU_ARCH "${COMPUTE_CAPABILITY} * 10" OUTPUT_FORMAT DECIMAL)
+message(STATUS "GPU Compute Capability: ${COMPUTE_CAPABILITY}")
 CPMAddPackage(
         NAME CCCL
         GITHUB_REPOSITORY nvidia/cccl
@@ -28,10 +31,6 @@ CPMAddPackage(
 find_package(MPI REQUIRED COMPONENTS CXX)
 find_package(NVSHMEM REQUIRED HINTS "$ENV{NVSHMEM_HOME}/lib/cmake/nvshmem")
 find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
-string(SUBSTRING "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" 0 2 COMPUTE_CAPABILITY) # xx-real -> xx
-math(EXPR GPU_ARCH "${COMPUTE_CAPABILITY} * 10" OUTPUT_FORMAT DECIMAL)
-message(STATUS "GPU Compute Capability: ${COMPUTE_CAPABILITY}")
 find_library(NCCL
         NAMES libnccl_static.a
         REQUIRED
@@ -103,6 +102,10 @@ function(dcl_target_common tgt)
     target_compile_definitions(${tgt} PRIVATE ARCH=${GPU_ARCH})
 endfunction()
 ## examples
+add_executable(explore
+        examples/explore.cu
+)
+dcl_example_target(explore)
 add_executable(bt
         examples/bootstrap.cu
         include/dcl/bootstrap.cuh
